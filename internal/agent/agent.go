@@ -929,6 +929,21 @@ func (a *Agent) SendProfileReport(report *openuem_nats.ProfileReport) error {
 	return nil
 }
 
+func (a *Agent) SendTaskStartReport(report *openuem_nats.TaskStartReport) error {
+	data, err := json.Marshal(report)
+	if err != nil {
+		log.Printf("[ERROR]: could not marshal task start report, reason: %v", err)
+		return err
+	}
+
+	if _, err := a.NATSConnection.Request("wingetcfg.task_started", data, 2*time.Minute); err != nil {
+		log.Printf("[ERROR]: could not send task start report via NATS, reason: %v", err)
+		return err
+	}
+
+	return nil
+}
+
 func (a *Agent) StartRustDeskSubscribe() error {
 	_, err := a.NATSConnection.QueueSubscribe("agent.rustdesk.start."+a.Config.UUID, "openuem-agent-management", func(msg *nats.Msg) {
 

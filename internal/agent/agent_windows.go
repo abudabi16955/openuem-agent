@@ -408,9 +408,12 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 
 		profileReport.Tasks = taskReports
 		for _, t := range taskReports {
+			if t.Timeout {
+				profileReport.Timeout = true
+				profileReport.Success = false
+			}
 			if t.Failed {
 				profileReport.Success = false
-				break
 			}
 		}
 
@@ -702,15 +705,20 @@ func (a *Agent) GetServerCertificate() {
 	}
 }
 
-func (a *Agent) ExecutePowerShellScript(script string) (string, string, error) {
+func (a *Agent) ExecutePowerShellScript(script string, timeout ...time.Duration) (string, string, bool, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+
+	t := 300 * time.Second
+	if len(timeout) > 0 && timeout[0] > 0 {
+		t = timeout[0]
+	}
 
 	if script != "" {
 		file, err := os.CreateTemp(os.TempDir(), "*.ps1")
 		if err != nil {
 			log.Printf("[ERROR]: could not create temp ps1 file, reason: %v", err)
-			return "", "", fmt.Errorf("could not create temp ps1 file, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not create temp ps1 file, reason: %v", err)
 		} else {
 			defer func() {
 				if err := file.Close(); err != nil {
@@ -719,18 +727,18 @@ func (a *Agent) ExecutePowerShellScript(script string) (string, string, error) {
 			}()
 			if _, err := file.Write([]byte(script)); err != nil {
 				log.Printf("[ERROR]: could not execute write on temp ps1 file, reason: %v", err)
-				return "", "", fmt.Errorf("could not execute write on temp ps1 file, reason: %v", err)
+				return "", "", false, fmt.Errorf("could not execute write on temp ps1 file, reason: %v", err)
 			}
 			if err := file.Close(); err != nil {
 				log.Printf("[ERROR]: could not close temp ps1 file, reason: %v", err)
-				return "", "", fmt.Errorf("could not close temp ps1 file, reason: %v", err)
+				return "", "", false, fmt.Errorf("could not close temp ps1 file, reason: %v", err)
 			}
 
 			// Get current Execution-Policy
 			out, err := exec.Command("PowerShell", "-command", "Get-ExecutionPolicy -Scope CurrentUser").CombinedOutput()
 			if err != nil {
 				log.Printf("[ERROR]: could not get current Powershell execution policy, reason: %v, %s", err, string(out))
-				return "", "", fmt.Errorf("could not get current Powershell execution policy, reason: %v, %s", err, string(out))
+				return "", "", false, fmt.Errorf("could not get current Powershell execution policy, reason: %v, %s", err, string(out))
 			}
 			currentExecutionPolicy := strings.TrimSpace(string(out))
 
@@ -738,7 +746,7 @@ func (a *Agent) ExecutePowerShellScript(script string) (string, string, error) {
 			out, err = exec.Command("PowerShell", "-command", "Set-ExecutionPolicy RemoteSigned -Scope CurrentUser").CombinedOutput()
 			if err != nil {
 				log.Printf("[ERROR]: could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
-				return "", "", fmt.Errorf("could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
+				return "", "", false, fmt.Errorf("could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
 			}
 			defer func() {
 				// Revert back to previous ExecutionPolicy
@@ -752,9 +760,42 @@ func (a *Agent) ExecutePowerShellScript(script string) (string, string, error) {
 			cmd := exec.Command("PowerShell", "-File", file.Name())
 			cmd.Stderr = &stderr
 			cmd.Stdout = &stdout
-			if err := cmd.Run(); err != nil {
-				log.Printf("[ERROR]: could not execute powershell script, reason: %v, %s", err, string(out))
-				return "", "", fmt.Errorf("could not execute powershell script, reason: %v, %s", err, string(out))
+			if err := cmd.Start(); err != nil {
+				log.Printf("[ERROR]: could not start powershell script, reason: %v", err)
+				return "", "", false, fmt.Errorf("could not start powershell script, reason: %v", err)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- cmd.Wait()
+			}()
+
+			var timer <-chan time.Time
+			if t > 0 {
+				tmr := time.NewTimer(t)
+				defer tmr.Stop()
+				timer = tmr.C
+			}
+
+			select {
+			case <-timer:
+				log.Printf("[WARN]: powershell script timed out after %v, killing process tree for PID %d", t, cmd.Process.Pid)
+				if killErr := dsc.KillProcessTreeWindows(cmd.Process.Pid); killErr != nil {
+					_ = cmd.Process.Kill()
+				}
+				<-done
+				if err := os.Remove(file.Name()); err != nil {
+					log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
+				}
+				return stdout.String(), fmt.Sprintf("powershell script execution timed out after %v", t), true, dsc.ErrTimeout
+			case err := <-done:
+				if err != nil {
+					log.Printf("[ERROR]: could not execute powershell script, reason: %v, %s", err, stderr.String())
+					if err := os.Remove(file.Name()); err != nil {
+						log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
+					}
+					return stdout.String(), stderr.String(), false, fmt.Errorf("could not execute powershell script, reason: %v", err)
+				}
 			}
 
 			if a.Config.Debug {
@@ -765,71 +806,67 @@ func (a *Agent) ExecutePowerShellScript(script string) (string, string, error) {
 				log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
 			}
 
-			return stdout.String(), stderr.String(), nil
+			return stdout.String(), stderr.String(), false, nil
 		}
 	}
 
-	return "", "", nil
+	return "", "", false, nil
+}
+
+func parseTaskIDFromName(name string) int {
+	prefixTrimmed := strings.TrimPrefix(name, "task_")
+	parts := strings.Split(prefixTrimmed, "_")
+	if len(parts) > 0 {
+		if id, err := strconv.Atoi(parts[0]); err == nil {
+			return id
+		}
+	}
+	return 0
 }
 
 func (a *Agent) RunTasks(cfg wingetcfg.WinGetCfg, profileID int, taskControlPath string, taskControl *dsc.TaskControl, force bool) ([]openuem_nats.TaskReport, error) {
 	taskReports := []openuem_nats.TaskReport{}
 
 	for _, resource := range cfg.Properties.Resources {
+		startTime := time.Now().Local().Format(time.RFC3339Nano)
+		startReport := openuem_nats.TaskStartReport{
+			ProfileID: profileID,
+			AgentID:   a.Config.UUID,
+			TaskID:    parseTaskIDFromName(resource.ID),
+			Name:      resource.ID,
+			StartTime: startTime,
+		}
+		if err := a.SendTaskStartReport(&startReport); err != nil {
+			log.Printf("[ERROR]: could not send task start report for %s: %v", resource.ID, err)
+		}
+
+		var taskReport *openuem_nats.TaskReport
+		var err error
+
 		switch resource.Resource {
 		case wingetcfg.OpenUEMPowershell:
-			taskReport, err := a.PowershellTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.PowershellTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetLocalGroupResource:
-			taskReport, err := a.LocalGroupTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.LocalGroupTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetLocalUserResource:
-			taskReport, err := a.LocalUserTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.LocalUserTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetMSIPackageResource:
-			taskReport, err := a.MSIPackageTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.MSIPackageTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetPackageResource:
-			taskReport, err := a.PackageManagementTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.PackageManagementTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetRegistryResource:
-			taskReport, err := a.RegistryTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
+			taskReport, err = a.RegistryTask(resource, taskControlPath, taskControl, force)
+		}
 
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
+		if err != nil {
+			return nil, err
+		}
+
+		if taskReport != nil {
+			if taskReport.StartTime == "" {
+				taskReport.StartTime = startTime
 			}
+			taskReports = append(taskReports, *taskReport)
 		}
 	}
 
@@ -1447,13 +1484,13 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 
 	if !taskAlreadySuccessful || force {
 		if ensure == "Present" {
-			stdout, stderr, err := dsc.InstallMSIPackage(path, arguments, logPath)
-			if err != nil {
+			stdout, stderr, timedOut, err := dsc.InstallMSIPackage(path, arguments, logPath)
+			if err != nil && !timedOut {
 				log.Printf("[ERROR]: could not install MSI package reason: %v", err)
 				return nil, fmt.Errorf("could not install MSI package reason: %v", err)
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				log.Printf("[INFO]: MSI package has been installed from %s", path)
 			}
 
@@ -1461,11 +1498,12 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				Name:    r.ID,
 				StdOut:  stdout,
 				StdErr:  stderr,
-				Failed:  stderr != "",
+				Timeout: timedOut,
+				Failed:  timedOut || stderr != "",
 				EndTime: time.Now().Local().Format(time.RFC3339Nano),
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 					log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 				}
@@ -1474,13 +1512,13 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			return &taskReport, nil
 
 		} else {
-			stdout, stderr, err := dsc.UninstallMSIPackage(path, arguments, logPath)
-			if err != nil {
+			stdout, stderr, timedOut, err := dsc.UninstallMSIPackage(path, arguments, logPath)
+			if err != nil && !timedOut {
 				log.Printf("[ERROR]: could not uninstall MSI package reason: %v", err)
 				return nil, fmt.Errorf("could not uninstall MSI package reason: %v", err)
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				log.Printf("[INFO]: MSI package %s has been uninstalled", path)
 			}
 
@@ -1488,11 +1526,12 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				Name:    r.ID,
 				StdOut:  stdout,
 				StdErr:  stderr,
-				Failed:  stderr != "",
+				Timeout: timedOut,
+				Failed:  timedOut || stderr != "",
 				EndTime: time.Now().Local().Format(time.RFC3339Nano),
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 					log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 				}
@@ -1550,22 +1589,25 @@ func (a *Agent) PowershellTask(r *wingetcfg.WinGetResource, taskControlPath stri
 		if !taskAlreadySuccessful || force {
 			scriptsRun := strings.Split(a.Config.ScriptsRun, ",")
 			if !slices.Contains(scriptsRun, task.ID) {
-				stdout, stderr, err := a.ExecutePowerShellScript(task.Script)
-				if err != nil {
+				stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script)
+				if err != nil && !timedOut {
 					return nil, err
 				}
 
-				log.Printf("[INFO]: powershell script %s run successfully", task.Name)
+				if !timedOut {
+					log.Printf("[INFO]: powershell script %s run successfully", task.Name)
+				}
 
 				taskReport := openuem_nats.TaskReport{
 					Name:    task.ID,
 					StdOut:  stdout,
 					StdErr:  stderr,
-					Failed:  stderr != "",
+					Timeout: timedOut,
+					Failed:  timedOut || stderr != "",
 					EndTime: time.Now().Local().Format(time.RFC3339Nano),
 				}
 
-				if stderr == "" {
+				if stderr == "" && !timedOut {
 					if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 						log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 					}
@@ -1575,22 +1617,25 @@ func (a *Agent) PowershellTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			}
 		}
 	} else {
-		stdout, stderr, err := a.ExecutePowerShellScript(task.Script)
-		if err != nil {
+		stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script)
+		if err != nil && !timedOut {
 			return nil, err
 		}
 
-		log.Printf("[INFO]: powershell script %s run successfully", task.ID)
+		if !timedOut {
+			log.Printf("[INFO]: powershell script %s run successfully", task.ID)
+		}
 
 		taskReport := openuem_nats.TaskReport{
 			Name:    task.ID,
 			StdOut:  stdout,
 			StdErr:  stderr,
-			Failed:  stderr != "",
+			Timeout: timedOut,
+			Failed:  timedOut || stderr != "",
 			EndTime: time.Now().Local().Format(time.RFC3339Nano),
 		}
 
-		if stderr == "" {
+		if stderr == "" && !timedOut {
 			if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 				log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 			}
@@ -1843,6 +1888,10 @@ func (a *Agent) AgentRunTaskSubscribe() error {
 		profileReport.Tasks = tasks
 		profileReport.Success = true
 		for _, t := range tasks {
+			if t.Timeout {
+				profileReport.Timeout = true
+				profileReport.Success = false
+			}
 			if t.Failed {
 				profileReport.Success = false
 			}

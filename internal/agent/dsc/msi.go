@@ -4,14 +4,19 @@ package dsc
 
 import (
 	"errors"
+	"time"
 	"fmt"
 	"strings"
 )
 
-func InstallMSIPackage(path string, extraArguments string, logPath string) (string, string, error) {
-
+func InstallMSIPackage(path string, extraArguments string, logPath string, timeout ...time.Duration) (string, string, bool, error) {
 	if path == "" {
-		return "", "", errors.New("path cannot be empty")
+		return "", "", false, errors.New("path cannot be empty")
+	}
+
+	t := 3600 * time.Second
+	if len(timeout) > 0 && timeout[0] > 0 {
+		t = timeout[0]
 	}
 
 	// Installation path
@@ -31,26 +36,33 @@ func InstallMSIPackage(path string, extraArguments string, logPath string) (stri
 	// Execute command
 	command := fmt.Sprintf("(Start-Process msiexec.exe -Wait -Passthru -ArgumentList '%s').ExitCode", arguments)
 
-	stdout, stderr, err := RunTaskWithLowPriority(command)
+	stdout, stderr, timedOut, err := RunTaskWithTimeout(command, t)
+	if timedOut {
+		return "", stderr, true, err
+	}
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	if stderr != "" {
-		return "", stderr, nil
+		return "", stderr, false, nil
 	}
 
 	if strings.TrimSpace(stdout) == "0" {
-		return "The action completed successfully", "", nil
+		return "The action completed successfully", "", false, nil
 	}
 
-	return "", getMSIErrorCodeDescription(strings.TrimSpace(stdout)), nil
+	return "", getMSIErrorCodeDescription(strings.TrimSpace(stdout)), false, nil
 }
 
-func UninstallMSIPackage(path string, extraArguments string, logPath string) (string, string, error) {
-
+func UninstallMSIPackage(path string, extraArguments string, logPath string, timeout ...time.Duration) (string, string, bool, error) {
 	if path == "" {
-		return "", "", errors.New("path cannot be empty")
+		return "", "", false, errors.New("path cannot be empty")
+	}
+
+	t := 3600 * time.Second
+	if len(timeout) > 0 && timeout[0] > 0 {
+		t = timeout[0]
 	}
 
 	// Installation path
@@ -70,20 +82,23 @@ func UninstallMSIPackage(path string, extraArguments string, logPath string) (st
 	// Execute command
 	command := fmt.Sprintf("(Start-Process msiexec.exe -Wait -Passthru -ArgumentList '%s').ExitCode", arguments)
 
-	stdout, stderr, err := RunTaskWithLowPriority(command)
+	stdout, stderr, timedOut, err := RunTaskWithTimeout(command, t)
+	if timedOut {
+		return "", stderr, true, err
+	}
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	if stderr != "" {
-		return "", stderr, nil
+		return "", stderr, false, nil
 	}
 
 	if strings.TrimSpace(stdout) == "0" {
-		return "The action completed successfully", "", nil
+		return "The action completed successfully", "", false, nil
 	}
 
-	return "", getMSIErrorCodeDescription(strings.TrimSpace(stdout)), nil
+	return "", getMSIErrorCodeDescription(strings.TrimSpace(stdout)), false, nil
 }
 
 func getMSIErrorCodeDescription(code string) string {
