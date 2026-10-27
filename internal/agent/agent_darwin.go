@@ -545,9 +545,12 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 			}
 
 			for _, t := range tasks {
+				if t.Timeout {
+					profileReport.Timeout = true
+					profileReport.Success = false
+				}
 				if t.Failed {
 					profileReport.Success = false
-					break
 				}
 			}
 
@@ -707,7 +710,23 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 		),
 	)
 
-	executeErr := exec.Execute(context.TODO())
+	startTime := time.Now().Local().Format(time.RFC3339Nano)
+	startReport := openuem_nats.TaskStartReport{
+		ProfileID: profileID,
+		AgentID:   a.Config.UUID,
+		Name:      fmt.Sprintf("profile_%d", profileID),
+		StartTime: startTime,
+	}
+	if err := a.SendTaskStartReport(&startReport); err != nil {
+		log.Printf("[ERROR]: could not send task start report: %v", err)
+	}
+
+	timeout := 300 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	executeErr := exec.Execute(ctx)
+	timedOut := ctx.Err() == context.DeadlineExceeded
 
 	// Generate the report
 	res, err := results.ParseJSONResultsStream(io.Reader(buff))
@@ -722,23 +741,34 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 				h, ok := t.Hosts["127.0.0.1"]
 				if ok {
 					taskReport := openuem_nats.TaskReport{
-						Name:    t.Task.Name,
-						Failed:  h.Failed,
-						EndTime: t.Task.Duration.End,
+						Name:      t.Task.Name,
+						Failed:    h.Failed || timedOut,
+						Timeout:   timedOut,
+						StartTime: startTime,
+						EndTime:   t.Task.Duration.End,
 					}
 					if h.Stdout != nil {
 						taskReport.StdOut = h.Stdout.(string)
 					}
 
-					if h.Stderr != nil {
-						taskReport.StdErr = h.Stderr.(string)
-					}
-					tasks = append(tasks, taskReport)
+				if h.Stderr != nil {
+					taskReport.StdErr = h.Stderr.(string)
+				}
+				tasks = append(tasks, taskReport)
 				}
 			}
 		}
 	} else {
-		if executeErr != nil {
+		if timedOut {
+			tasks = append(tasks, openuem_nats.TaskReport{
+				Name:      fmt.Sprintf("profile_%d", profileID),
+				Failed:    true,
+				Timeout:   true,
+				StartTime: startTime,
+				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				StdErr:    fmt.Sprintf("playbook execution timed out after %v", timeout),
+			})
+		} else if executeErr != nil {
 			log.Printf("[INFO]: an error was found executing the Ansible playbook, reason: %v", err)
 			return nil, err
 		}
@@ -1047,6 +1077,10 @@ func (a *Agent) AgentRunTaskSubscribe() error {
 		profileReport.Tasks = tasks
 		profileReport.Success = true
 		for _, t := range tasks {
+			if t.Timeout {
+				profileReport.Timeout = true
+				profileReport.Success = false
+			}
 			if t.Failed {
 				profileReport.Success = false
 			}
