@@ -813,31 +813,22 @@ func (a *Agent) ExecutePowerShellScript(script string, timeout ...time.Duration)
 	return "", "", false, nil
 }
 
-func parseTaskIDFromName(name string) int {
-	prefixTrimmed := strings.TrimPrefix(name, "task_")
-	parts := strings.Split(prefixTrimmed, "_")
-	if len(parts) > 0 {
-		if id, err := strconv.Atoi(parts[0]); err == nil {
-			return id
-		}
-	}
-	return 0
-}
-
 func (a *Agent) RunTasks(cfg wingetcfg.WinGetCfg, profileID int, taskControlPath string, taskControl *dsc.TaskControl, force bool) ([]openuem_nats.TaskReport, error) {
 	taskReports := []openuem_nats.TaskReport{}
 
 	for _, resource := range cfg.Properties.Resources {
 		startTime := time.Now().Local().Format(time.RFC3339Nano)
+		taskID := getTaskIDFromResource(resource)
+		name := getTaskNameFromResource(resource, taskID)
 		startReport := openuem_nats.TaskStartReport{
 			ProfileID: profileID,
 			AgentID:   a.Config.UUID,
-			TaskID:    parseTaskIDFromName(resource.ID),
-			Name:      resource.ID,
+			TaskID:    taskID,
+			Name:      name,
 			StartTime: startTime,
 		}
 		if err := a.SendTaskStartReport(&startReport); err != nil {
-			log.Printf("[ERROR]: could not send task start report for %s: %v", resource.ID, err)
+			log.Printf("[ERROR]: could not send task start report for %s: %v", name, err)
 		}
 
 		var taskReport *openuem_nats.TaskReport
@@ -1480,11 +1471,17 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 		return nil, err
 	}
 
+	timeoutDuration := getTimeoutFromSettings(r.Settings)
+	var timeoutArgs []time.Duration
+	if timeoutDuration > 0 {
+		timeoutArgs = append(timeoutArgs, timeoutDuration)
+	}
+
 	taskAlreadySuccessful := slices.Contains(t.Success, r.ID)
 
 	if !taskAlreadySuccessful || force {
 		if ensure == "Present" {
-			stdout, stderr, timedOut, err := dsc.InstallMSIPackage(path, arguments, logPath)
+			stdout, stderr, timedOut, err := dsc.InstallMSIPackage(path, arguments, logPath, timeoutArgs...)
 			if err != nil && !timedOut {
 				log.Printf("[ERROR]: could not install MSI package reason: %v", err)
 				return nil, fmt.Errorf("could not install MSI package reason: %v", err)
@@ -1512,7 +1509,7 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			return &taskReport, nil
 
 		} else {
-			stdout, stderr, timedOut, err := dsc.UninstallMSIPackage(path, arguments, logPath)
+			stdout, stderr, timedOut, err := dsc.UninstallMSIPackage(path, arguments, logPath, timeoutArgs...)
 			if err != nil && !timedOut {
 				log.Printf("[ERROR]: could not uninstall MSI package reason: %v", err)
 				return nil, fmt.Errorf("could not uninstall MSI package reason: %v", err)
@@ -1584,12 +1581,18 @@ func (a *Agent) PowershellTask(r *wingetcfg.WinGetResource, taskControlPath stri
 		return nil, errors.New("could not find script key in task's settings")
 	}
 
+	timeoutDuration := getTimeoutFromSettings(r.Settings)
+	var timeoutArgs []time.Duration
+	if timeoutDuration > 0 {
+		timeoutArgs = append(timeoutArgs, timeoutDuration)
+	}
+
 	taskAlreadySuccessful := slices.Contains(t.Success, task.ID)
 	if task.RunConfig == "once" {
 		if !taskAlreadySuccessful || force {
 			scriptsRun := strings.Split(a.Config.ScriptsRun, ",")
 			if !slices.Contains(scriptsRun, task.ID) {
-				stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script)
+				stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script, timeoutArgs...)
 				if err != nil && !timedOut {
 					return nil, err
 				}
@@ -1617,7 +1620,7 @@ func (a *Agent) PowershellTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			}
 		}
 	} else {
-		stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script)
+		stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script, timeoutArgs...)
 		if err != nil && !timedOut {
 			return nil, err
 		}
