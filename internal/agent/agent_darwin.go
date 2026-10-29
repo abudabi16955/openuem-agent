@@ -538,7 +538,7 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 				log.Println("[DEBUG]: we're going to apply the configuration")
 			}
 
-			tasks, err := a.ApplyConfiguration(p.ProfileID, cfg, taskControl, taskControlPath)
+			tasks, err := a.ApplyConfiguration(p.ProfileID, cfg, taskControl, taskControlPath, p.Timeout)
 			if err != nil {
 				log.Println("[ERROR]: could not apply YAML configuration file with Ansible")
 				profileReport.Error = err.Error()
@@ -588,7 +588,7 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 	}
 }
 
-func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *dsc.TaskControl, taskControlPath string) ([]openuem_nats.TaskReport, error) {
+func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *dsc.TaskControl, taskControlPath string, profileTimeout ...int) ([]openuem_nats.TaskReport, error) {
 	var cfg []ansiblecfg.AnsiblePlaybook
 
 	var playbookCmd *playbook.AnsiblePlaybookCmd
@@ -700,16 +700,6 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 		)
 	}
 
-	exec := measure.NewExecutorTimeMeasurement(
-		stdoutcallback.NewJSONStdoutCallbackExecute(
-			execute.NewDefaultExecute(
-				execute.WithCmd(playbookCmd),
-				execute.WithErrorEnrich(playbook.NewAnsiblePlaybookErrorEnrich()),
-				execute.WithWrite(io.Writer(buff)),
-			),
-		),
-	)
-
 	startTime := time.Now().Local().Format(time.RFC3339Nano)
 	startReport := openuem_nats.TaskStartReport{
 		ProfileID: profileID,
@@ -721,12 +711,13 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 		log.Printf("[ERROR]: could not send task start report: %v", err)
 	}
 
-	timeout := 300 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	timeoutSec := 300
+	if len(profileTimeout) > 0 && profileTimeout[0] > 0 {
+		timeoutSec = profileTimeout[0]
+	}
+	timeoutDuration := time.Duration(timeoutSec) * time.Second
 
-	executeErr := exec.Execute(ctx)
-	timedOut := ctx.Err() == context.DeadlineExceeded
+	timedOut, executeErr := a.ExecuteAnsiblePlaybook(playbookCmd, io.Writer(buff), timeoutSec)
 
 	// Generate the report
 	res, err := results.ParseJSONResultsStream(io.Reader(buff))
@@ -766,7 +757,7 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 				Timeout:   true,
 				StartTime: startTime,
 				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
-				StdErr:    fmt.Sprintf("playbook execution timed out after %v", timeout),
+				StdErr:    fmt.Sprintf("playbook execution timed out after %v", timeoutDuration),
 			})
 		} else if executeErr != nil {
 			log.Printf("[INFO]: an error was found executing the Ansible playbook, reason: %v", err)
@@ -777,6 +768,29 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 	log.Printf("[INFO]: an Ansible playbook was run for profile %d", profileID)
 
 	return tasks, nil
+}
+
+func (a *Agent) ExecuteAnsiblePlaybook(playbookCmd *playbook.AnsiblePlaybookCmd, buff io.Writer, timeoutSec int) (bool, error) {
+	exec := measure.NewExecutorTimeMeasurement(
+		stdoutcallback.NewJSONStdoutCallbackExecute(
+			execute.NewDefaultExecute(
+				execute.WithCmd(playbookCmd),
+				execute.WithErrorEnrich(playbook.NewAnsiblePlaybookErrorEnrich()),
+				execute.WithWrite(buff),
+			),
+		),
+	)
+
+	timeoutDuration := 300 * time.Second
+	if timeoutSec > 0 {
+		timeoutDuration = time.Duration(timeoutSec) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
+	defer cancel()
+
+	executeErr := exec.Execute(ctx)
+	timedOut := ctx.Err() == context.DeadlineExceeded
+	return timedOut, executeErr
 }
 
 func CreatePlaybooksFolder() (string, error) {
@@ -1062,7 +1076,7 @@ func (a *Agent) AgentRunTaskSubscribe() error {
 			log.Printf("[ERROR]: could not send the response to agent.ansible message")
 		}
 
-		tasks, err := a.ApplyConfiguration(profileConfig.ProfileID, cfg, taskControl, taskControlPath)
+		tasks, err := a.ApplyConfiguration(profileConfig.ProfileID, cfg, taskControl, taskControlPath, profileConfig.Timeout)
 		if err != nil {
 			log.Println("[ERROR]: could not apply YAML configuration file with Ansible")
 			profileReport.Error = err.Error()
