@@ -697,7 +697,7 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 
 	// Generate the report
 	res, err := results.ParseJSONResultsStream(io.Reader(buff))
-	if err == nil {
+	if err == nil && len(res.Plays) > 0 {
 		for _, p := range res.Plays {
 			for _, t := range p.Tasks {
 				// skip the gathering facts task
@@ -725,7 +725,9 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 				}
 			}
 		}
-	} else {
+	}
+
+	if len(tasks) == 0 {
 		if timedOut {
 			tasks = append(tasks, openuem_nats.TaskReport{
 				Name:      fmt.Sprintf("profile_%d", profileID),
@@ -736,8 +738,35 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 				StdErr:    fmt.Sprintf("playbook execution timed out after %v", timeoutDuration),
 			})
 		} else if executeErr != nil {
-			log.Printf("[INFO]: an error was found executing the Ansible playbook, reason: %v", err)
-			return nil, err
+			log.Printf("[WARN]: an error occurred executing Ansible playbook: %v", executeErr)
+			errContent := buff.String()
+			if errContent == "" {
+				errContent = executeErr.Error()
+			} else if !strings.Contains(errContent, executeErr.Error()) {
+				errContent = fmt.Sprintf("%s\n%v", errContent, executeErr)
+			}
+			tasks = append(tasks, openuem_nats.TaskReport{
+				Name:      fmt.Sprintf("profile_%d", profileID),
+				Failed:    true,
+				Timeout:   false,
+				StartTime: startTime,
+				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				StdErr:    errContent,
+			})
+		} else if err != nil {
+			log.Printf("[WARN]: could not parse Ansible JSON results: %v", err)
+			errContent := buff.String()
+			if errContent == "" {
+				errContent = fmt.Sprintf("could not parse Ansible results JSON: %v", err)
+			}
+			tasks = append(tasks, openuem_nats.TaskReport{
+				Name:      fmt.Sprintf("profile_%d", profileID),
+				Failed:    true,
+				Timeout:   false,
+				StartTime: startTime,
+				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				StdErr:    errContent,
+			})
 		}
 	}
 
@@ -770,9 +799,12 @@ func (a *Agent) ExecuteAnsiblePlaybook(playbookCmd *playbook.AnsiblePlaybookCmd,
 }
 
 func CreatePlaybooksFolder() (string, error) {
-	cwd := "/etc/openuem-agent"
+	cwd := os.Getenv("OPENUEM_PLAYBOOKS_DIR")
+	if cwd == "" {
+		cwd = "/etc/openuem-agent"
+	}
 	folder := filepath.Join(cwd, "ansible")
-	return folder, os.MkdirAll(folder, 0660)
+	return folder, os.MkdirAll(folder, 0755)
 }
 
 func installCommunityGeneralCollection() error {
