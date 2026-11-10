@@ -680,25 +680,26 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 	log.Printf("[INFO]: received a request to apply profile %d", profileID)
 
 	buff := new(bytes.Buffer)
+	errBuff := new(bytes.Buffer)
 
 	ansiblePlaybookOptions := &playbook.AnsiblePlaybookOptions{
 		Connection: "local",
 		Inventory:  "127.0.0.1,",
 	}
 
-	if runtime.GOARCH == "amd64" {
-		playbookCmd = playbook.NewAnsiblePlaybookCmd(
-			playbook.WithPlaybooks(pbFile.Name()),
-			playbook.WithPlaybookOptions(ansiblePlaybookOptions),
-			playbook.WithBinary("/usr/local/bin/ansible-playbook"),
-		)
-	} else {
-		playbookCmd = playbook.NewAnsiblePlaybookCmd(
-			playbook.WithPlaybooks(pbFile.Name()),
-			playbook.WithPlaybookOptions(ansiblePlaybookOptions),
-			playbook.WithBinary("/opt/homebrew/bin/ansible-playbook"),
-		)
+	ansibleBinary := "/usr/local/bin/ansible-playbook"
+	if runtime.GOARCH != "amd64" {
+		ansibleBinary = "/opt/homebrew/bin/ansible-playbook"
 	}
+	if envBin := os.Getenv("OPENUEM_ANSIBLE_PLAYBOOK_BIN"); envBin != "" {
+		ansibleBinary = envBin
+	}
+
+	playbookCmd = playbook.NewAnsiblePlaybookCmd(
+		playbook.WithPlaybooks(pbFile.Name()),
+		playbook.WithPlaybookOptions(ansiblePlaybookOptions),
+		playbook.WithBinary(ansibleBinary),
+	)
 
 	startTime := time.Now().Local().Format(time.RFC3339Nano)
 	startReport := openuem_nats.TaskStartReport{
@@ -717,7 +718,7 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 	}
 	timeoutDuration := time.Duration(timeoutSec) * time.Second
 
-	timedOut, executeErr := a.ExecuteAnsiblePlaybook(playbookCmd, io.Writer(buff), timeoutSec)
+	timedOut, executeErr := a.ExecuteAnsiblePlaybook(playbookCmd, io.Writer(buff), timeoutSec, io.Writer(errBuff))
 
 	// Generate the report
 	res, err := results.ParseJSONResultsStream(io.Reader(buff))
@@ -745,6 +746,9 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 					if h.Stderr != nil {
 						taskReport.StdErr = h.Stderr.(string)
 					}
+					if taskReport.StdErr == "" && (taskReport.Failed || executeErr != nil) && errBuff.Len() > 0 {
+						taskReport.StdErr = strings.TrimSpace(errBuff.String())
+					}
 					tasks = append(tasks, taskReport)
 				}
 			}
@@ -763,11 +767,12 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 			})
 		} else if executeErr != nil {
 			log.Printf("[WARN]: an error occurred executing Ansible playbook: %v", executeErr)
-			errContent := buff.String()
+			errContent := strings.TrimSpace(errBuff.String())
+			if errContent == "" {
+				errContent = strings.TrimSpace(buff.String())
+			}
 			if errContent == "" {
 				errContent = executeErr.Error()
-			} else if !strings.Contains(errContent, executeErr.Error()) {
-				errContent = fmt.Sprintf("%s\n%v", errContent, executeErr)
 			}
 			tasks = append(tasks, openuem_nats.TaskReport{
 				Name:      fmt.Sprintf("profile_%d", profileID),
@@ -779,7 +784,10 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 			})
 		} else if err != nil {
 			log.Printf("[WARN]: could not parse Ansible JSON results: %v", err)
-			errContent := buff.String()
+			errContent := strings.TrimSpace(errBuff.String())
+			if errContent == "" {
+				errContent = strings.TrimSpace(buff.String())
+			}
 			if errContent == "" {
 				errContent = fmt.Sprintf("could not parse Ansible results JSON: %v", err)
 			}
@@ -799,14 +807,21 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 	return tasks, nil
 }
 
-func (a *Agent) ExecuteAnsiblePlaybook(playbookCmd *playbook.AnsiblePlaybookCmd, buff io.Writer, timeoutSec int) (bool, error) {
+func (a *Agent) ExecuteAnsiblePlaybook(playbookCmd *playbook.AnsiblePlaybookCmd, buff io.Writer, timeoutSec int, errBuff ...io.Writer) (bool, error) {
+	execOpts := []execute.ExecuteOptions{
+		execute.WithCmd(playbookCmd),
+		execute.WithErrorEnrich(playbook.NewAnsiblePlaybookErrorEnrich()),
+		execute.WithWrite(buff),
+	}
+	if len(errBuff) > 0 && errBuff[0] != nil {
+		execOpts = append(execOpts, execute.WithWriteError(errBuff[0]))
+	} else {
+		execOpts = append(execOpts, execute.WithWriteError(buff))
+	}
+
 	exec := measure.NewExecutorTimeMeasurement(
 		stdoutcallback.NewJSONStdoutCallbackExecute(
-			execute.NewDefaultExecute(
-				execute.WithCmd(playbookCmd),
-				execute.WithErrorEnrich(playbook.NewAnsiblePlaybookErrorEnrich()),
-				execute.WithWrite(buff),
-			),
+			execute.NewDefaultExecute(execOpts...),
 		),
 	)
 
