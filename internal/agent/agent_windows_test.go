@@ -3,7 +3,9 @@
 package agent
 
 import (
+	"bytes"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/open-uem/openuem-agent/internal/agent/dsc"
@@ -110,5 +112,21 @@ func TestRunTasksMultipleTasksContinueOnFailure(t *testing.T) {
 		if r.EndTime == "" {
 			t.Errorf("report %d (%s) expected non-empty EndTime", i, r.Name)
 		}
+	}
+}
+
+
+func TestPreparePowerShellScriptWindows(t *testing.T) {
+	script := "Write-Output 'zażółć gęślą jaźń'"
+	res := preparePowerShellScript(script)
+	if !bytes.HasPrefix(res, UTF8BOM) {
+		t.Fatalf("expected UTF-8 BOM prefix")
+	}
+	expectedHeader := "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n"
+	if !strings.HasPrefix(string(res[len(UTF8BOM):]), expectedHeader) {
+		t.Fatalf("expected encoding header")
+	}
+	if !strings.Contains(string(res), "zażółć gęślą jaźń") {
+		t.Fatalf("expected Polish characters to be preserved")
 	}
 }
