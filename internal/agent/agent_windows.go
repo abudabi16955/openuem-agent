@@ -719,95 +719,85 @@ func (a *Agent) ExecutePowerShellScript(script string, timeout ...time.Duration)
 		if err != nil {
 			log.Printf("[ERROR]: could not create temp ps1 file, reason: %v", err)
 			return "", "", false, fmt.Errorf("could not create temp ps1 file, reason: %v", err)
-		} else {
-			defer func() {
-				if err := file.Close(); err != nil {
-					// file may have been closed earlier
-				}
-			}()
-			if _, err := file.Write([]byte(script)); err != nil {
-				log.Printf("[ERROR]: could not execute write on temp ps1 file, reason: %v", err)
-				return "", "", false, fmt.Errorf("could not execute write on temp ps1 file, reason: %v", err)
-			}
-			if err := file.Close(); err != nil {
-				log.Printf("[ERROR]: could not close temp ps1 file, reason: %v", err)
-				return "", "", false, fmt.Errorf("could not close temp ps1 file, reason: %v", err)
-			}
+		}
+		defer func() {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+		}()
 
-			// Get current Execution-Policy
-			out, err := exec.Command("PowerShell", "-command", "Get-ExecutionPolicy -Scope CurrentUser").CombinedOutput()
-			if err != nil {
-				log.Printf("[ERROR]: could not get current Powershell execution policy, reason: %v, %s", err, string(out))
-				return "", "", false, fmt.Errorf("could not get current Powershell execution policy, reason: %v, %s", err, string(out))
-			}
+		scriptBytes := preparePowerShellScript(script)
+		if _, err := file.Write(scriptBytes); err != nil {
+			log.Printf("[ERROR]: could not execute write on temp ps1 file, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not execute write on temp ps1 file, reason: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			log.Printf("[ERROR]: could not close temp ps1 file, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not close temp ps1 file, reason: %v", err)
+		}
+
+		// Get current Execution-Policy
+		out, err := exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-command", "Get-ExecutionPolicy -Scope CurrentUser").CombinedOutput()
+		if err != nil {
+			log.Printf("[WARN]: could not get current Powershell execution policy, reason: %v, %s", err, string(out))
+		} else {
 			currentExecutionPolicy := strings.TrimSpace(string(out))
 
 			// Set ExecutionPolicy temporarily to RemoteSigned
-			out, err = exec.Command("PowerShell", "-command", "Set-ExecutionPolicy RemoteSigned -Scope CurrentUser").CombinedOutput()
+			out, err = exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-command", "Set-ExecutionPolicy RemoteSigned -Scope CurrentUser").CombinedOutput()
 			if err != nil {
-				log.Printf("[ERROR]: could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
-				return "", "", false, fmt.Errorf("could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
-			}
-			defer func() {
-				// Revert back to previous ExecutionPolicy
-				out, err = exec.Command("PowerShell", "-command", fmt.Sprintf("Set-ExecutionPolicy %s -Scope CurrentUser", currentExecutionPolicy)).CombinedOutput()
-				if err != nil {
-					log.Printf("[ERROR]: could not revert the Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
-				}
-			}()
-
-			// Execute script
-			cmd := exec.Command("PowerShell", "-File", file.Name())
-			cmd.Stderr = &stderr
-			cmd.Stdout = &stdout
-			if err := cmd.Start(); err != nil {
-				log.Printf("[ERROR]: could not start powershell script, reason: %v", err)
-				return "", "", false, fmt.Errorf("could not start powershell script, reason: %v", err)
-			}
-
-			done := make(chan error, 1)
-			go func() {
-				done <- cmd.Wait()
-			}()
-
-			var timer <-chan time.Time
-			if t > 0 {
-				tmr := time.NewTimer(t)
-				defer tmr.Stop()
-				timer = tmr.C
-			}
-
-			select {
-			case <-timer:
-				log.Printf("[WARN]: powershell script timed out after %v, killing process tree for PID %d", t, cmd.Process.Pid)
-				if killErr := dsc.KillProcessTreeWindows(cmd.Process.Pid); killErr != nil {
-					_ = cmd.Process.Kill()
-				}
-				<-done
-				if err := os.Remove(file.Name()); err != nil {
-					log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
-				}
-				return stdout.String(), fmt.Sprintf("powershell script execution timed out after %v", t), true, dsc.ErrTimeout
-			case err := <-done:
-				if err != nil {
-					log.Printf("[ERROR]: could not execute powershell script, reason: %v, %s", err, stderr.String())
-					if err := os.Remove(file.Name()); err != nil {
-						log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
+				log.Printf("[WARN]: could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
+			} else {
+				defer func() {
+					// Revert back to previous ExecutionPolicy
+					out, err = exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-command", fmt.Sprintf("Set-ExecutionPolicy %s -Scope CurrentUser", currentExecutionPolicy)).CombinedOutput()
+					if err != nil {
+						log.Printf("[WARN]: could not revert the Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
 					}
-					return stdout.String(), stderr.String(), false, fmt.Errorf("could not execute powershell script, reason: %v", err)
-				}
+				}()
 			}
-
-			if a.Config.Debug {
-				log.Printf("[DEBUG]: a script should have run: PowerShell -File %s", file.Name())
-			}
-
-			if err := os.Remove(file.Name()); err != nil {
-				log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
-			}
-
-			return stdout.String(), stderr.String(), false, nil
 		}
+
+		// Execute script with NoProfile, NonInteractive, ExecutionPolicy Bypass, and UTF-8 encoding
+		cmd := exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file.Name())
+		cmd.Stderr = &stderr
+		cmd.Stdout = &stdout
+		if err := cmd.Start(); err != nil {
+			log.Printf("[ERROR]: could not start powershell script, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not start powershell script, reason: %v", err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- cmd.Wait()
+		}()
+
+		var timer <-chan time.Time
+		if t > 0 {
+			tmr := time.NewTimer(t)
+			defer tmr.Stop()
+			timer = tmr.C
+		}
+
+		select {
+		case <-timer:
+			log.Printf("[WARN]: powershell script timed out after %v, killing process tree for PID %d", t, cmd.Process.Pid)
+			if killErr := dsc.KillProcessTreeWindows(cmd.Process.Pid); killErr != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-done
+			return stdout.String(), fmt.Sprintf("powershell script execution timed out after %v", t), true, dsc.ErrTimeout
+		case err := <-done:
+			if err != nil {
+				log.Printf("[ERROR]: could not execute powershell script, reason: %v, %s", err, stderr.String())
+				return stdout.String(), stderr.String(), false, fmt.Errorf("could not execute powershell script, reason: %v", err)
+			}
+		}
+
+		if a.Config.Debug {
+			log.Printf("[DEBUG]: a script should have run: PowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File %s", file.Name())
+		}
+
+		return stdout.String(), stderr.String(), false, nil
 	}
 
 	return "", "", false, nil
