@@ -916,6 +916,9 @@ func (a *Agent) RemovePrinter() error {
 }
 
 func (a *Agent) SendProfileReport(report *openuem_nats.ProfileReport) error {
+	if a.NATSConnection == nil {
+		return fmt.Errorf("nats connection is nil")
+	}
 	// Send report for profile
 	data, err := json.Marshal(report)
 	if err != nil {
@@ -923,6 +926,24 @@ func (a *Agent) SendProfileReport(report *openuem_nats.ProfileReport) error {
 	}
 
 	if _, err := a.NATSConnection.Request("wingetcfg.report", data, 2*time.Minute); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *Agent) SendTaskStartReport(report *openuem_nats.TaskStartReport) error {
+	if a.NATSConnection == nil {
+		return fmt.Errorf("nats connection is nil")
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		log.Printf("[ERROR]: could not marshal task start report, reason: %v", err)
+		return err
+	}
+
+	if _, err := a.NATSConnection.Request("wingetcfg.task_started", data, 2*time.Minute); err != nil {
+		log.Printf("[ERROR]: could not send task start report via NATS, reason: %v", err)
 		return err
 	}
 

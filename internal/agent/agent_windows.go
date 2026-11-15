@@ -408,9 +408,12 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 
 		profileReport.Tasks = taskReports
 		for _, t := range taskReports {
+			if t.Timeout {
+				profileReport.Timeout = true
+				profileReport.Success = false
+			}
 			if t.Failed {
 				profileReport.Success = false
-				break
 			}
 		}
 
@@ -702,134 +705,170 @@ func (a *Agent) GetServerCertificate() {
 	}
 }
 
-func (a *Agent) ExecutePowerShellScript(script string) (string, string, error) {
+func (a *Agent) ExecutePowerShellScript(script string, timeout ...time.Duration) (string, string, bool, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+
+	t := 300 * time.Second
+	if len(timeout) > 0 && timeout[0] > 0 {
+		t = timeout[0]
+	}
 
 	if script != "" {
 		file, err := os.CreateTemp(os.TempDir(), "*.ps1")
 		if err != nil {
 			log.Printf("[ERROR]: could not create temp ps1 file, reason: %v", err)
-			return "", "", fmt.Errorf("could not create temp ps1 file, reason: %v", err)
-		} else {
-			defer func() {
-				if err := file.Close(); err != nil {
-					// file may have been closed earlier
-				}
-			}()
-			if _, err := file.Write([]byte(script)); err != nil {
-				log.Printf("[ERROR]: could not execute write on temp ps1 file, reason: %v", err)
-				return "", "", fmt.Errorf("could not execute write on temp ps1 file, reason: %v", err)
-			}
-			if err := file.Close(); err != nil {
-				log.Printf("[ERROR]: could not close temp ps1 file, reason: %v", err)
-				return "", "", fmt.Errorf("could not close temp ps1 file, reason: %v", err)
-			}
+			return "", "", false, fmt.Errorf("could not create temp ps1 file, reason: %v", err)
+		}
+		defer func() {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+		}()
 
-			// Get current Execution-Policy
-			out, err := exec.Command("PowerShell", "-command", "Get-ExecutionPolicy -Scope CurrentUser").CombinedOutput()
-			if err != nil {
-				log.Printf("[ERROR]: could not get current Powershell execution policy, reason: %v, %s", err, string(out))
-				return "", "", fmt.Errorf("could not get current Powershell execution policy, reason: %v, %s", err, string(out))
-			}
+		scriptBytes := preparePowerShellScript(script)
+		if _, err := file.Write(scriptBytes); err != nil {
+			log.Printf("[ERROR]: could not execute write on temp ps1 file, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not execute write on temp ps1 file, reason: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			log.Printf("[ERROR]: could not close temp ps1 file, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not close temp ps1 file, reason: %v", err)
+		}
+
+		// Get current Execution-Policy
+		out, err := exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-command", "Get-ExecutionPolicy -Scope CurrentUser").CombinedOutput()
+		if err != nil {
+			log.Printf("[WARN]: could not get current Powershell execution policy, reason: %v, %s", err, string(out))
+		} else {
 			currentExecutionPolicy := strings.TrimSpace(string(out))
 
 			// Set ExecutionPolicy temporarily to RemoteSigned
-			out, err = exec.Command("PowerShell", "-command", "Set-ExecutionPolicy RemoteSigned -Scope CurrentUser").CombinedOutput()
+			out, err = exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-command", "Set-ExecutionPolicy RemoteSigned -Scope CurrentUser").CombinedOutput()
 			if err != nil {
-				log.Printf("[ERROR]: could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
-				return "", "", fmt.Errorf("could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
+				log.Printf("[WARN]: could not set Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
+			} else {
+				defer func() {
+					// Revert back to previous ExecutionPolicy
+					out, err = exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-command", fmt.Sprintf("Set-ExecutionPolicy %s -Scope CurrentUser", currentExecutionPolicy)).CombinedOutput()
+					if err != nil {
+						log.Printf("[WARN]: could not revert the Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
+					}
+				}()
 			}
-			defer func() {
-				// Revert back to previous ExecutionPolicy
-				out, err = exec.Command("PowerShell", "-command", fmt.Sprintf("Set-ExecutionPolicy %s -Scope CurrentUser", currentExecutionPolicy)).CombinedOutput()
-				if err != nil {
-					log.Printf("[ERROR]: could not revert the Powershell execution policy to RemoteSigned temporarily, reason: %v, %s", err, string(out))
-				}
-			}()
-
-			// Execute script
-			cmd := exec.Command("PowerShell", "-File", file.Name())
-			cmd.Stderr = &stderr
-			cmd.Stdout = &stdout
-			if err := cmd.Run(); err != nil {
-				log.Printf("[ERROR]: could not execute powershell script, reason: %v, %s", err, string(out))
-				return "", "", fmt.Errorf("could not execute powershell script, reason: %v, %s", err, string(out))
-			}
-
-			if a.Config.Debug {
-				log.Printf("[DEBUG]: a script should have run: PowerShell -File %s", file.Name())
-			}
-
-			if err := os.Remove(file.Name()); err != nil {
-				log.Printf("[ERROR]: could not remove temp ps1 file, reason: %v", err)
-			}
-
-			return stdout.String(), stderr.String(), nil
 		}
+
+		// Execute script with NoProfile, NonInteractive, ExecutionPolicy Bypass, and UTF-8 encoding
+		cmd := exec.Command("PowerShell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file.Name())
+		cmd.Stderr = &stderr
+		cmd.Stdout = &stdout
+		if err := cmd.Start(); err != nil {
+			log.Printf("[ERROR]: could not start powershell script, reason: %v", err)
+			return "", "", false, fmt.Errorf("could not start powershell script, reason: %v", err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- cmd.Wait()
+		}()
+
+		var timer <-chan time.Time
+		if t > 0 {
+			tmr := time.NewTimer(t)
+			defer tmr.Stop()
+			timer = tmr.C
+		}
+
+		select {
+		case <-timer:
+			log.Printf("[WARN]: powershell script timed out after %v, killing process tree for PID %d", t, cmd.Process.Pid)
+			if killErr := dsc.KillProcessTreeWindows(cmd.Process.Pid); killErr != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-done
+			return stdout.String(), fmt.Sprintf("powershell script execution timed out after %v", t), true, dsc.ErrTimeout
+		case err := <-done:
+			if err != nil {
+				log.Printf("[ERROR]: could not execute powershell script, reason: %v, %s", err, stderr.String())
+				return stdout.String(), stderr.String(), false, fmt.Errorf("could not execute powershell script, reason: %v", err)
+			}
+		}
+
+		if a.Config.Debug {
+			log.Printf("[DEBUG]: a script should have run: PowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File %s", file.Name())
+		}
+
+		return stdout.String(), stderr.String(), false, nil
 	}
 
-	return "", "", nil
+	return "", "", false, nil
 }
 
 func (a *Agent) RunTasks(cfg wingetcfg.WinGetCfg, profileID int, taskControlPath string, taskControl *dsc.TaskControl, force bool) ([]openuem_nats.TaskReport, error) {
 	taskReports := []openuem_nats.TaskReport{}
 
 	for _, resource := range cfg.Properties.Resources {
+		startTime := time.Now().Local().Format(time.RFC3339Nano)
+		taskID := getTaskIDFromResource(resource)
+		name := getTaskNameFromResource(resource, taskID)
+		startReport := openuem_nats.TaskStartReport{
+			ProfileID: profileID,
+			AgentID:   a.Config.UUID,
+			TaskID:    taskID,
+			Name:      name,
+			StartTime: startTime,
+		}
+		if err := a.SendTaskStartReport(&startReport); err != nil {
+			log.Printf("[ERROR]: could not send task start report for %s: %v", name, err)
+		}
+
+		var taskReport *openuem_nats.TaskReport
+		var err error
+
 		switch resource.Resource {
 		case wingetcfg.OpenUEMPowershell:
-			taskReport, err := a.PowershellTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.PowershellTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetLocalGroupResource:
-			taskReport, err := a.LocalGroupTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.LocalGroupTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetLocalUserResource:
-			taskReport, err := a.LocalUserTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.LocalUserTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetMSIPackageResource:
-			taskReport, err := a.MSIPackageTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.MSIPackageTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetPackageResource:
-			taskReport, err := a.PackageManagementTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
-
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
-			}
+			taskReport, err = a.PackageManagementTask(resource, taskControlPath, taskControl, force)
 		case wingetcfg.WinGetRegistryResource:
-			taskReport, err := a.RegistryTask(resource, taskControlPath, taskControl, force)
-			if err != nil {
-				return nil, err
-			}
+			taskReport, err = a.RegistryTask(resource, taskControlPath, taskControl, force)
+		}
 
-			if taskReport != nil {
-				taskReports = append(taskReports, *taskReport)
+		if err != nil {
+			log.Printf("[ERROR]: task %s execution failed: %v", name, err)
+			if taskReport == nil {
+				taskReport = &openuem_nats.TaskReport{
+					Name:      name,
+					StdErr:    err.Error(),
+					Failed:    true,
+					Timeout:   errors.Is(err, dsc.ErrTimeout),
+					StartTime: startTime,
+					EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				}
+			} else {
+				taskReport.Failed = true
+				if taskReport.StdErr == "" {
+					taskReport.StdErr = err.Error()
+				}
+				if errors.Is(err, dsc.ErrTimeout) {
+					taskReport.Timeout = true
+				}
 			}
+		}
+
+		if taskReport != nil {
+			if taskReport.StartTime == "" {
+				taskReport.StartTime = startTime
+			}
+			if taskReport.EndTime == "" {
+				taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+			}
+			taskReports = append(taskReports, *taskReport)
 		}
 	}
 
@@ -884,12 +923,25 @@ func (a *Agent) PackageManagementTask(r *wingetcfg.WinGetResource, taskControlPa
 		if !taskAlreadySuccessful || force {
 			stdout, stderr, err := deploy.InstallPackage(action, keepUpdated, a.Config.Debug)
 			if err != nil {
-				return nil, err
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				return &openuem_nats.TaskReport{
+					Name:    r.ID,
+					StdOut:  stdout,
+					StdErr:  combinedErr,
+					Failed:  true,
+					EndTime: time.Now().Local().Format(time.RFC3339Nano),
+				}, nil
 			}
 
 			if err := a.SendWinGetCfgDeploymentReport(packageID, packageName, "install"); err != nil {
 				log.Printf("[ERROR]: could not send WinGetCfg deployment report, reason: %v", err)
-				return nil, err
 			}
 
 			// if package must not be kept updated, mark the task as successful
@@ -915,11 +967,24 @@ func (a *Agent) PackageManagementTask(r *wingetcfg.WinGetResource, taskControlPa
 		if !taskAlreadySuccessful || force {
 			stdout, stderr, err := deploy.UninstallPackage(action)
 			if err != nil {
-				return nil, err
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				return &openuem_nats.TaskReport{
+					Name:    r.ID,
+					StdOut:  stdout,
+					StdErr:  combinedErr,
+					Failed:  true,
+					EndTime: time.Now().Local().Format(time.RFC3339Nano),
+				}, nil
 			}
 			if err := a.SendWinGetCfgDeploymentReport(packageID, packageName, "uninstall"); err != nil {
 				log.Printf("[ERROR]: could not send WinGetCfg deployment report, reason: %v", err)
-				return nil, err
 			}
 
 			if stderr == "" {
@@ -989,7 +1054,20 @@ func (a *Agent) RegistryTask(r *wingetcfg.WinGetResource, taskControlPath string
 					stdout, stderr, err := dsc.UpdateRegistryKeyDefaultValue(key, valueData)
 					if err != nil {
 						log.Printf("[ERROR]: could not update registry %s default value, reason: %v", key, err)
-						return nil, fmt.Errorf("could not update registry %s default value, reason: %v", key, err)
+						combinedErr := stderr
+						if combinedErr != "" {
+							if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+								combinedErr = combinedErr + "\n" + err.Error()
+							}
+						} else {
+							combinedErr = err.Error()
+						}
+						taskReport.Name = r.ID
+						taskReport.StdOut = stdout
+						taskReport.StdErr = combinedErr
+						taskReport.Failed = true
+						taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+						return &taskReport, nil
 					}
 					log.Printf("[INFO]: registry key default value %s has been updated", key)
 
@@ -1008,7 +1086,20 @@ func (a *Agent) RegistryTask(r *wingetcfg.WinGetResource, taskControlPath string
 					stdout, stderr, err := dsc.AddRegistryKey(key, forceRegistry)
 					if err != nil {
 						log.Printf("[ERROR]: could not add registry key %s, reason: %v", key, err)
-						return nil, fmt.Errorf("could not add registry key %s, reason: %v", key, err)
+						combinedErr := stderr
+						if combinedErr != "" {
+							if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+								combinedErr = combinedErr + "\n" + err.Error()
+							}
+						} else {
+							combinedErr = err.Error()
+						}
+						taskReport.Name = r.ID
+						taskReport.StdOut = stdout
+						taskReport.StdErr = combinedErr
+						taskReport.Failed = true
+						taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+						return &taskReport, nil
 					}
 					log.Printf("[INFO]: registry key %s has been added", key)
 
@@ -1033,7 +1124,20 @@ func (a *Agent) RegistryTask(r *wingetcfg.WinGetResource, taskControlPath string
 				stdout, stderr, err := dsc.AddOrEditRegistryValue(key, valueName, propertyType, valueData, hex, force)
 				if err != nil {
 					log.Printf("[ERROR]: could not add registry value key %s, reason: %v", valueName, err)
-					return nil, fmt.Errorf("could not add registry value key %s, reason: %v", valueName, err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport.Name = r.ID
+					taskReport.StdOut = stdout
+					taskReport.StdErr = combinedErr
+					taskReport.Failed = true
+					taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+					return &taskReport, nil
 				}
 
 				taskReport.Name = r.ID
@@ -1066,7 +1170,20 @@ func (a *Agent) RegistryTask(r *wingetcfg.WinGetResource, taskControlPath string
 				stdout, stderr, err := dsc.RemoveRegistryKey(key, force)
 				if err != nil {
 					log.Printf("[ERROR]: could not remove registry key %s, reason: %v", key, err)
-					return nil, fmt.Errorf("could not remove registry key %s, reason: %v", key, err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport.Name = r.ID
+					taskReport.StdOut = stdout
+					taskReport.StdErr = combinedErr
+					taskReport.Failed = true
+					taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+					return &taskReport, nil
 				}
 				log.Printf("[INFO]: registry key %s has been removed", key)
 
@@ -1085,7 +1202,20 @@ func (a *Agent) RegistryTask(r *wingetcfg.WinGetResource, taskControlPath string
 				stdout, stderr, err := dsc.RemoveRegistryKeyValue(key, valueName)
 				if err != nil {
 					log.Printf("[ERROR]: could not remove registry key value %s, reason: %v", valueName, err)
-					return nil, fmt.Errorf("could not remove registry key value %s, reason: %v", valueName, err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport.Name = r.ID
+					taskReport.StdOut = stdout
+					taskReport.StdErr = combinedErr
+					taskReport.Failed = true
+					taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+					return &taskReport, nil
 				}
 				log.Printf("[INFO]: registry key value %s has been removed", valueName)
 
@@ -1174,14 +1304,27 @@ func (a *Agent) LocalUserTask(r *wingetcfg.WinGetResource, taskControlPath strin
 			stdout, stderr, err := dsc.CreateLocalUser(username, password, comment, fullName, disabled, passwordChangeNotAllowed, passwordNeverExpires, changePasswordAtLogon)
 			if err != nil {
 				log.Printf("[ERROR]: could not create the local user, reason: %v", err)
-				return nil, fmt.Errorf("could not create the local user, reason: %v", err)
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				taskReport.Name = r.ID
+				taskReport.StdOut = stdout
+				taskReport.StdErr = combinedErr
+				taskReport.Failed = true
+				taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+				return &taskReport, nil
 			}
 
 			taskReport.Name = r.ID
 			taskReport.StdOut = stdout
 			taskReport.StdErr = stderr
 			taskReport.Failed = stderr != ""
-			taskReport.EndTime = time.Now().Local().String()
+			taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
 
 			log.Printf("[INFO]: the local user %s has been added", username)
 
@@ -1195,14 +1338,27 @@ func (a *Agent) LocalUserTask(r *wingetcfg.WinGetResource, taskControlPath strin
 			stdout, stderr, err := dsc.DeleteLocalUser(username)
 			if err != nil {
 				log.Printf("[ERROR]: could not remove the local user, reason: %v", err)
-				return nil, fmt.Errorf("could not remove the local user, reason: %v", err)
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				taskReport.Name = r.ID
+				taskReport.StdOut = stdout
+				taskReport.StdErr = combinedErr
+				taskReport.Failed = true
+				taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
+				return &taskReport, nil
 			}
 
 			taskReport.Name = r.ID
 			taskReport.StdOut = stdout
 			taskReport.StdErr = stderr
 			taskReport.Failed = stderr != ""
-			taskReport.EndTime = time.Now().Local().String()
+			taskReport.EndTime = time.Now().Local().Format(time.RFC3339Nano)
 
 			log.Printf("[INFO]: the local user %s has been deleted", username)
 
@@ -1261,7 +1417,22 @@ func (a *Agent) LocalGroupTask(r *wingetcfg.WinGetResource, taskControlPath stri
 
 				if err != nil {
 					log.Printf("[ERROR]: could not create local group, reason: %v", err)
-					return nil, fmt.Errorf("could not create local group, reason: %v", err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport := openuem_nats.TaskReport{
+						Name:    r.ID,
+						StdOut:  stdout,
+						StdErr:  combinedErr,
+						Failed:  true,
+						EndTime: time.Now().Local().Format(time.RFC3339Nano),
+					}
+					return &taskReport, nil
 				}
 
 				taskReport := openuem_nats.TaskReport{
@@ -1288,7 +1459,22 @@ func (a *Agent) LocalGroupTask(r *wingetcfg.WinGetResource, taskControlPath stri
 					stdout, stderr, err := dsc.CreateLocalGroup(groupName, description)
 					if err != nil {
 						log.Printf("[ERROR]: could not create local group, reason: %v", err)
-						return nil, fmt.Errorf("could not create local group, reason: %v", err)
+						combinedErr := stderr
+						if combinedErr != "" {
+							if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+								combinedErr = combinedErr + "\n" + err.Error()
+							}
+						} else {
+							combinedErr = err.Error()
+						}
+						taskReport := openuem_nats.TaskReport{
+							Name:    r.ID,
+							StdOut:  stdout,
+							StdErr:  combinedErr,
+							Failed:  true,
+							EndTime: time.Now().Local().Format(time.RFC3339Nano),
+						}
+						return &taskReport, nil
 					}
 
 					taskReport := openuem_nats.TaskReport{
@@ -1308,7 +1494,22 @@ func (a *Agent) LocalGroupTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				stdout, stderr, err := dsc.AddMembersToLocalGroup(groupName, members)
 				if err != nil {
 					log.Printf("[ERROR]: could not add members to local group, reason: %v", err)
-					return nil, fmt.Errorf("could not add members to local group, reason: %v", err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport := openuem_nats.TaskReport{
+						Name:    r.ID,
+						StdOut:  stdout,
+						StdErr:  combinedErr,
+						Failed:  true,
+						EndTime: time.Now().Local().Format(time.RFC3339Nano),
+					}
+					return &taskReport, nil
 				}
 				log.Printf("[INFO]: members have been added to local group %s", groupName)
 
@@ -1335,7 +1536,22 @@ func (a *Agent) LocalGroupTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				if err != nil {
 					log.Println("stad", stdout, stderr)
 					log.Printf("[ERROR]: could not add members to local group, reason: %v", err)
-					return nil, fmt.Errorf("could not add members to local group, reason: %v", err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport := openuem_nats.TaskReport{
+						Name:    r.ID,
+						StdOut:  stdout,
+						StdErr:  combinedErr,
+						Failed:  true,
+						EndTime: time.Now().Local().Format(time.RFC3339Nano),
+					}
+					return &taskReport, nil
 				}
 
 				taskReport := openuem_nats.TaskReport{
@@ -1366,7 +1582,22 @@ func (a *Agent) LocalGroupTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				stdout, stderr, err := dsc.RemoveMembersFromLocalGroup(groupName, membersToExclude)
 				if err != nil {
 					log.Printf("[ERROR]: could not exclude members from local group, reason: %v", err)
-					return nil, fmt.Errorf("could not exclude members from local group, reason: %v", err)
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					taskReport := openuem_nats.TaskReport{
+						Name:    r.ID,
+						StdOut:  stdout,
+						StdErr:  combinedErr,
+						Failed:  true,
+						EndTime: time.Now().Local().Format(time.RFC3339Nano),
+					}
+					return &taskReport, nil
 				}
 				log.Printf("[INFO]: members have been removed from local group %s", groupName)
 
@@ -1395,7 +1626,22 @@ func (a *Agent) LocalGroupTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			stdout, stderr, err := dsc.RemoveLocalGroup(groupName)
 			if err != nil {
 				log.Printf("[ERROR]: could not delete local group, reason: %v", err)
-				return nil, fmt.Errorf("could not delete local group, reason: %v", err)
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				taskReport := openuem_nats.TaskReport{
+					Name:    r.ID,
+					StdOut:  stdout,
+					StdErr:  combinedErr,
+					Failed:  true,
+					EndTime: time.Now().Local().Format(time.RFC3339Nano),
+				}
+				return &taskReport, nil
 			}
 
 			taskReport := openuem_nats.TaskReport{
@@ -1443,17 +1689,38 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 		return nil, err
 	}
 
+	timeoutDuration := getTimeoutFromSettings(r.Settings)
+	var timeoutArgs []time.Duration
+	if timeoutDuration > 0 {
+		timeoutArgs = append(timeoutArgs, timeoutDuration)
+	}
+
 	taskAlreadySuccessful := slices.Contains(t.Success, r.ID)
 
 	if !taskAlreadySuccessful || force {
 		if ensure == "Present" {
-			stdout, stderr, err := dsc.InstallMSIPackage(path, arguments, logPath)
-			if err != nil {
+			stdout, stderr, timedOut, err := dsc.InstallMSIPackage(path, arguments, logPath, timeoutArgs...)
+			if err != nil && !timedOut {
 				log.Printf("[ERROR]: could not install MSI package reason: %v", err)
-				return nil, fmt.Errorf("could not install MSI package reason: %v", err)
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				return &openuem_nats.TaskReport{
+					Name:    r.ID,
+					StdOut:  stdout,
+					StdErr:  combinedErr,
+					Timeout: timedOut,
+					Failed:  true,
+					EndTime: time.Now().Local().Format(time.RFC3339Nano),
+				}, nil
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				log.Printf("[INFO]: MSI package has been installed from %s", path)
 			}
 
@@ -1461,11 +1728,12 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				Name:    r.ID,
 				StdOut:  stdout,
 				StdErr:  stderr,
-				Failed:  stderr != "",
+				Timeout: timedOut,
+				Failed:  timedOut || stderr != "",
 				EndTime: time.Now().Local().Format(time.RFC3339Nano),
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 					log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 				}
@@ -1474,13 +1742,28 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			return &taskReport, nil
 
 		} else {
-			stdout, stderr, err := dsc.UninstallMSIPackage(path, arguments, logPath)
-			if err != nil {
+			stdout, stderr, timedOut, err := dsc.UninstallMSIPackage(path, arguments, logPath, timeoutArgs...)
+			if err != nil && !timedOut {
 				log.Printf("[ERROR]: could not uninstall MSI package reason: %v", err)
-				return nil, fmt.Errorf("could not uninstall MSI package reason: %v", err)
+				combinedErr := stderr
+				if combinedErr != "" {
+					if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+						combinedErr = combinedErr + "\n" + err.Error()
+					}
+				} else {
+					combinedErr = err.Error()
+				}
+				return &openuem_nats.TaskReport{
+					Name:    r.ID,
+					StdOut:  stdout,
+					StdErr:  combinedErr,
+					Timeout: timedOut,
+					Failed:  true,
+					EndTime: time.Now().Local().Format(time.RFC3339Nano),
+				}, nil
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				log.Printf("[INFO]: MSI package %s has been uninstalled", path)
 			}
 
@@ -1488,11 +1771,12 @@ func (a *Agent) MSIPackageTask(r *wingetcfg.WinGetResource, taskControlPath stri
 				Name:    r.ID,
 				StdOut:  stdout,
 				StdErr:  stderr,
-				Failed:  stderr != "",
+				Timeout: timedOut,
+				Failed:  timedOut || stderr != "",
 				EndTime: time.Now().Local().Format(time.RFC3339Nano),
 			}
 
-			if stderr == "" {
+			if stderr == "" && !timedOut {
 				if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 					log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 				}
@@ -1545,27 +1829,51 @@ func (a *Agent) PowershellTask(r *wingetcfg.WinGetResource, taskControlPath stri
 		return nil, errors.New("could not find script key in task's settings")
 	}
 
+	timeoutDuration := getTimeoutFromSettings(r.Settings)
+	var timeoutArgs []time.Duration
+	if timeoutDuration > 0 {
+		timeoutArgs = append(timeoutArgs, timeoutDuration)
+	}
+
 	taskAlreadySuccessful := slices.Contains(t.Success, task.ID)
 	if task.RunConfig == "once" {
 		if !taskAlreadySuccessful || force {
 			scriptsRun := strings.Split(a.Config.ScriptsRun, ",")
 			if !slices.Contains(scriptsRun, task.ID) {
-				stdout, stderr, err := a.ExecutePowerShellScript(task.Script)
-				if err != nil {
-					return nil, err
+				stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script, timeoutArgs...)
+				if err != nil && !timedOut {
+					combinedErr := stderr
+					if combinedErr != "" {
+						if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+							combinedErr = combinedErr + "\n" + err.Error()
+						}
+					} else {
+						combinedErr = err.Error()
+					}
+					return &openuem_nats.TaskReport{
+						Name:    task.ID,
+						StdOut:  stdout,
+						StdErr:  combinedErr,
+						Timeout: timedOut,
+						Failed:  true,
+						EndTime: time.Now().Local().Format(time.RFC3339Nano),
+					}, nil
 				}
 
-				log.Printf("[INFO]: powershell script %s run successfully", task.Name)
+				if !timedOut {
+					log.Printf("[INFO]: powershell script %s run successfully", task.Name)
+				}
 
 				taskReport := openuem_nats.TaskReport{
 					Name:    task.ID,
 					StdOut:  stdout,
 					StdErr:  stderr,
-					Failed:  stderr != "",
+					Timeout: timedOut,
+					Failed:  timedOut || stderr != "",
 					EndTime: time.Now().Local().Format(time.RFC3339Nano),
 				}
 
-				if stderr == "" {
+				if stderr == "" && !timedOut {
 					if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 						log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 					}
@@ -1575,22 +1883,40 @@ func (a *Agent) PowershellTask(r *wingetcfg.WinGetResource, taskControlPath stri
 			}
 		}
 	} else {
-		stdout, stderr, err := a.ExecutePowerShellScript(task.Script)
-		if err != nil {
-			return nil, err
+		stdout, stderr, timedOut, err := a.ExecutePowerShellScript(task.Script, timeoutArgs...)
+		if err != nil && !timedOut {
+			combinedErr := stderr
+			if combinedErr != "" {
+				if err.Error() != "" && !strings.Contains(combinedErr, err.Error()) {
+					combinedErr = combinedErr + "\n" + err.Error()
+				}
+			} else {
+				combinedErr = err.Error()
+			}
+			return &openuem_nats.TaskReport{
+				Name:    task.ID,
+				StdOut:  stdout,
+				StdErr:  combinedErr,
+				Timeout: timedOut,
+				Failed:  true,
+				EndTime: time.Now().Local().Format(time.RFC3339Nano),
+			}, nil
 		}
 
-		log.Printf("[INFO]: powershell script %s run successfully", task.ID)
+		if !timedOut {
+			log.Printf("[INFO]: powershell script %s run successfully", task.ID)
+		}
 
 		taskReport := openuem_nats.TaskReport{
 			Name:    task.ID,
 			StdOut:  stdout,
 			StdErr:  stderr,
-			Failed:  stderr != "",
+			Timeout: timedOut,
+			Failed:  timedOut || stderr != "",
 			EndTime: time.Now().Local().Format(time.RFC3339Nano),
 		}
 
-		if stderr == "" {
+		if stderr == "" && !timedOut {
 			if err := dsc.SetTaskAsSuccessfull(r.ID, taskControlPath, t); err != nil {
 				log.Printf("[INFO]: could not set task %s as successful in JSON control file", r.ID)
 			}
@@ -1843,6 +2169,10 @@ func (a *Agent) AgentRunTaskSubscribe() error {
 		profileReport.Tasks = tasks
 		profileReport.Success = true
 		for _, t := range tasks {
+			if t.Timeout {
+				profileReport.Timeout = true
+				profileReport.Success = false
+			}
 			if t.Failed {
 				profileReport.Success = false
 			}

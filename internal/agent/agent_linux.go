@@ -531,16 +531,19 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 				log.Println("[DEBUG]: we're going to apply the configuration")
 			}
 
-			tasks, err := a.ApplyConfiguration(p.ProfileID, cfg, taskControl, taskControlPath)
+			tasks, err := a.ApplyConfiguration(p.ProfileID, cfg, taskControl, taskControlPath, p.Timeout)
 			if err != nil {
 				log.Println("[ERROR]: could not apply YAML configuration file with Ansible")
 				profileReport.Error = err.Error()
 			}
 
 			for _, t := range tasks {
+				if t.Timeout {
+					profileReport.Timeout = true
+					profileReport.Success = false
+				}
 				if t.Failed {
 					profileReport.Success = false
-					break
 				}
 			}
 
@@ -579,7 +582,7 @@ func (a *Agent) ProcessProfileResponse(msg *nats.Msg, force bool) {
 	}
 }
 
-func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *dsc.TaskControl, taskControlPath string) ([]openuem_nats.TaskReport, error) {
+func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *dsc.TaskControl, taskControlPath string, profileTimeout ...int) ([]openuem_nats.TaskReport, error) {
 	var cfg []ansiblecfg.AnsiblePlaybook
 
 	tasks := []openuem_nats.TaskReport{}
@@ -662,32 +665,44 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 	log.Printf("[INFO]: received a request to apply profile %d", profileID)
 
 	buff := new(bytes.Buffer)
+	errBuff := new(bytes.Buffer)
 
 	ansiblePlaybookOptions := &playbook.AnsiblePlaybookOptions{
 		Connection: "local",
 		Inventory:  "127.0.0.1,",
 	}
 
-	playbookCmd := playbook.NewAnsiblePlaybookCmd(
+	playbookOpts := []playbook.AnsiblePlaybookOptionsFunc{
 		playbook.WithPlaybooks(pbFile.Name()),
 		playbook.WithPlaybookOptions(ansiblePlaybookOptions),
-	)
+	}
+	if envBin := os.Getenv("OPENUEM_ANSIBLE_PLAYBOOK_BIN"); envBin != "" {
+		playbookOpts = append(playbookOpts, playbook.WithBinary(envBin))
+	}
+	playbookCmd := playbook.NewAnsiblePlaybookCmd(playbookOpts...)
 
-	exec := measure.NewExecutorTimeMeasurement(
-		stdoutcallback.NewJSONStdoutCallbackExecute(
-			execute.NewDefaultExecute(
-				execute.WithCmd(playbookCmd),
-				execute.WithErrorEnrich(playbook.NewAnsiblePlaybookErrorEnrich()),
-				execute.WithWrite(io.Writer(buff)),
-			),
-		),
-	)
+	startTime := time.Now().Local().Format(time.RFC3339Nano)
+	startReport := openuem_nats.TaskStartReport{
+		ProfileID: profileID,
+		AgentID:   a.Config.UUID,
+		Name:      fmt.Sprintf("profile_%d", profileID),
+		StartTime: startTime,
+	}
+	if err := a.SendTaskStartReport(&startReport); err != nil {
+		log.Printf("[ERROR]: could not send task start report: %v", err)
+	}
 
-	executeErr := exec.Execute(context.TODO())
+	timeoutSec := 300
+	if len(profileTimeout) > 0 && profileTimeout[0] > 0 {
+		timeoutSec = profileTimeout[0]
+	}
+	timeoutDuration := time.Duration(timeoutSec) * time.Second
+
+	timedOut, executeErr := a.ExecuteAnsiblePlaybook(playbookCmd, io.Writer(buff), timeoutSec, io.Writer(errBuff))
 
 	// Generate the report
 	res, err := results.ParseJSONResultsStream(io.Reader(buff))
-	if err == nil {
+	if err == nil && len(res.Plays) > 0 {
 		for _, p := range res.Plays {
 			for _, t := range p.Tasks {
 				// skip the gathering facts task
@@ -698,9 +713,11 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 				h, ok := t.Hosts["127.0.0.1"]
 				if ok {
 					taskReport := openuem_nats.TaskReport{
-						Name:    t.Task.Name,
-						Failed:  h.Failed,
-						EndTime: t.Task.Duration.End,
+						Name:      t.Task.Name,
+						Failed:    h.Failed || timedOut,
+						Timeout:   timedOut,
+						StartTime: startTime,
+						EndTime:   t.Task.Duration.End,
 					}
 					if h.Stdout != nil {
 						taskReport.StdOut = h.Stdout.(string)
@@ -709,14 +726,59 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 					if h.Stderr != nil {
 						taskReport.StdErr = h.Stderr.(string)
 					}
+					if taskReport.StdErr == "" && (taskReport.Failed || executeErr != nil) && errBuff.Len() > 0 {
+						taskReport.StdErr = strings.TrimSpace(errBuff.String())
+					}
 					tasks = append(tasks, taskReport)
 				}
 			}
 		}
-	} else {
-		if executeErr != nil {
-			log.Printf("[INFO]: an error was found executing the Ansible playbook, reason: %v", err)
-			return nil, err
+	}
+
+	if len(tasks) == 0 {
+		if timedOut {
+			tasks = append(tasks, openuem_nats.TaskReport{
+				Name:      fmt.Sprintf("profile_%d", profileID),
+				Failed:    true,
+				Timeout:   true,
+				StartTime: startTime,
+				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				StdErr:    fmt.Sprintf("playbook execution timed out after %v", timeoutDuration),
+			})
+		} else if executeErr != nil {
+			log.Printf("[WARN]: an error occurred executing Ansible playbook: %v", executeErr)
+			errContent := strings.TrimSpace(errBuff.String())
+			if errContent == "" {
+				errContent = strings.TrimSpace(buff.String())
+			}
+			if errContent == "" {
+				errContent = executeErr.Error()
+			}
+			tasks = append(tasks, openuem_nats.TaskReport{
+				Name:      fmt.Sprintf("profile_%d", profileID),
+				Failed:    true,
+				Timeout:   false,
+				StartTime: startTime,
+				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				StdErr:    errContent,
+			})
+		} else if err != nil {
+			log.Printf("[WARN]: could not parse Ansible JSON results: %v", err)
+			errContent := strings.TrimSpace(errBuff.String())
+			if errContent == "" {
+				errContent = strings.TrimSpace(buff.String())
+			}
+			if errContent == "" {
+				errContent = fmt.Sprintf("could not parse Ansible results JSON: %v", err)
+			}
+			tasks = append(tasks, openuem_nats.TaskReport{
+				Name:      fmt.Sprintf("profile_%d", profileID),
+				Failed:    true,
+				Timeout:   false,
+				StartTime: startTime,
+				EndTime:   time.Now().Local().Format(time.RFC3339Nano),
+				StdErr:    errContent,
+			})
 		}
 	}
 
@@ -725,10 +787,43 @@ func (a *Agent) ApplyConfiguration(profileID int, config []byte, taskControl *ds
 	return tasks, nil
 }
 
+func (a *Agent) ExecuteAnsiblePlaybook(playbookCmd *playbook.AnsiblePlaybookCmd, buff io.Writer, timeoutSec int, errBuff ...io.Writer) (bool, error) {
+	execOpts := []execute.ExecuteOptions{
+		execute.WithCmd(playbookCmd),
+		execute.WithErrorEnrich(playbook.NewAnsiblePlaybookErrorEnrich()),
+		execute.WithWrite(buff),
+	}
+	if len(errBuff) > 0 && errBuff[0] != nil {
+		execOpts = append(execOpts, execute.WithWriteError(errBuff[0]))
+	} else {
+		execOpts = append(execOpts, execute.WithWriteError(buff))
+	}
+
+	exec := measure.NewExecutorTimeMeasurement(
+		stdoutcallback.NewJSONStdoutCallbackExecute(
+			execute.NewDefaultExecute(execOpts...),
+		),
+	)
+
+	timeoutDuration := 300 * time.Second
+	if timeoutSec > 0 {
+		timeoutDuration = time.Duration(timeoutSec) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
+	defer cancel()
+
+	executeErr := exec.Execute(ctx)
+	timedOut := ctx.Err() == context.DeadlineExceeded
+	return timedOut, executeErr
+}
+
 func CreatePlaybooksFolder() (string, error) {
-	cwd := "/etc/openuem-agent"
+	cwd := os.Getenv("OPENUEM_PLAYBOOKS_DIR")
+	if cwd == "" {
+		cwd = "/etc/openuem-agent"
+	}
 	folder := filepath.Join(cwd, "ansible")
-	return folder, os.MkdirAll(folder, 0660)
+	return folder, os.MkdirAll(folder, 0755)
 }
 
 func installCommunityGeneralCollection() error {
@@ -966,7 +1061,7 @@ func (a *Agent) AgentRunTaskSubscribe() error {
 			log.Printf("[ERROR]: could not send the response to agent.ansible message")
 		}
 
-		tasks, err := a.ApplyConfiguration(profileConfig.ProfileID, cfg, taskControl, taskControlPath)
+		tasks, err := a.ApplyConfiguration(profileConfig.ProfileID, cfg, taskControl, taskControlPath, profileConfig.Timeout)
 		if err != nil {
 			log.Println("[ERROR]: could not apply YAML configuration file with Ansible")
 			profileReport.Error = err.Error()
@@ -981,6 +1076,10 @@ func (a *Agent) AgentRunTaskSubscribe() error {
 		profileReport.Tasks = tasks
 		profileReport.Success = true
 		for _, t := range tasks {
+			if t.Timeout {
+				profileReport.Timeout = true
+				profileReport.Success = false
+			}
 			if t.Failed {
 				profileReport.Success = false
 			}
