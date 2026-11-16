@@ -25,6 +25,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	openuem_nats "github.com/open-uem/nats"
 	"github.com/open-uem/openuem-agent/internal/agent/dsc"
+	"github.com/open-uem/openuem-agent/internal/bitlocker"
 	"github.com/open-uem/openuem-agent/internal/commands/deploy"
 	rd "github.com/open-uem/openuem-agent/internal/commands/remote-desktop"
 	"github.com/open-uem/openuem-agent/internal/commands/report"
@@ -103,6 +104,7 @@ func (a *Agent) Start() {
 		return
 	}
 	a.SubscribeToNATSSubjects()
+	go a.CheckBitLockerEscrow(false)
 
 	// Run report for the first time after start if agent is enabled
 	if a.Config.Enabled {
@@ -160,6 +162,7 @@ func (a *Agent) startNATSConnectJob() error {
 				// We have connected
 				a.TaskScheduler.RemoveJob(a.NATSConnectJob.ID())
 				a.SubscribeToNATSSubjects()
+				go a.CheckBitLockerEscrow(false)
 
 				// Start the rest of tasks
 				a.startReportJob()
@@ -2213,4 +2216,68 @@ func (a *Agent) RunProfileSubscribe() error {
 		return fmt.Errorf("[ERROR]: could not subscribe to agent run profile subject, reason: %v", err)
 	}
 	return nil
+}
+
+
+func (a *Agent) BitLockerForceEscrowSubscribe() error {
+	if a.NATSConnection == nil {
+		return fmt.Errorf("could not subscribe to BitLocker force escrow, reason: NATS connection is nil")
+	}
+
+	subject := openuem_nats.BitLockerForceEscrowSubject(a.Config.UUID)
+	_, err := a.NATSConnection.QueueSubscribe(subject, "openuem-agent-management", func(msg *nats.Msg) {
+		log.Printf("[INFO]: BitLocker force escrow request received on %s", msg.Subject)
+
+		var req openuem_nats.BitLockerForceEscrowRequest
+		if len(msg.Data) > 0 {
+			if err := json.Unmarshal(msg.Data, &req); err != nil {
+				log.Printf("[WARN]: could not unmarshal BitLocker force escrow request: %v", err)
+			}
+		}
+
+		escrowedCount, escrowErr := a.PerformBitLockerEscrow(true)
+		if escrowErr != nil {
+			log.Printf("[ERROR]: BitLocker force escrow failed: %v", escrowErr)
+		} else {
+			log.Printf("[INFO]: BitLocker force escrow completed successfully, %d keys escrowed", escrowedCount)
+		}
+
+		if msg.Reply != "" {
+			resp := map[string]interface{}{
+				"success":        escrowErr == nil,
+				"agent_id":       a.Config.UUID,
+				"escrowed_count": escrowedCount,
+			}
+			if escrowErr != nil {
+				resp["error"] = escrowErr.Error()
+			}
+			respBytes, _ := json.Marshal(resp)
+			if err := msg.Respond(respBytes); err != nil {
+				log.Printf("[ERROR]: could not respond to BitLocker force escrow message: %v", err)
+			}
+		}
+	})
+
+	if err != nil {
+		return fmt.Errorf("could not subscribe to BitLocker force escrow, reason: %w", err)
+	}
+	return nil
+}
+
+func (a *Agent) CheckBitLockerEscrow(force bool) {
+	if a.NATSConnection == nil || !a.NATSConnection.IsConnected() {
+		return
+	}
+	svc := bitlocker.NewEscrowService(a.NATSConnection, a.Config.UUID)
+	if _, err := svc.CheckAndEscrowKeys(force); err != nil {
+		log.Printf("[WARN]: BitLocker escrow check error: %v", err)
+	}
+}
+
+func (a *Agent) PerformBitLockerEscrow(force bool) (int, error) {
+	if a.NATSConnection == nil || !a.NATSConnection.IsConnected() {
+		return 0, fmt.Errorf("NATS connection is not ready")
+	}
+	svc := bitlocker.NewEscrowService(a.NATSConnection, a.Config.UUID)
+	return svc.CheckAndEscrowKeys(force)
 }

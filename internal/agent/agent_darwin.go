@@ -1184,3 +1184,36 @@ func (a *Agent) RunProfileSubscribe() error {
 	}
 	return nil
 }
+
+
+func (a *Agent) BitLockerForceEscrowSubscribe() error {
+	if a.NATSConnection == nil {
+		return fmt.Errorf("could not subscribe to BitLocker force escrow, reason: NATS connection is nil")
+	}
+
+	subject := openuem_nats.BitLockerForceEscrowSubject(a.Config.UUID)
+	_, err := a.NATSConnection.QueueSubscribe(subject, "openuem-agent-management", func(msg *nats.Msg) {
+		log.Println("[INFO]: BitLocker force escrow request received, but BitLocker is not supported on this platform")
+		if msg.Reply != "" {
+			resp := map[string]interface{}{
+				"success":  false,
+				"agent_id": a.Config.UUID,
+				"error":    "BitLocker is not supported on this platform",
+			}
+			respBytes, _ := json.Marshal(resp)
+			_ = msg.Respond(respBytes)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("could not subscribe to BitLocker force escrow, reason: %w", err)
+	}
+	return nil
+}
+
+func (a *Agent) CheckBitLockerEscrow(force bool) {
+	// BitLocker is not supported on this platform
+}
+
+func (a *Agent) PerformBitLockerEscrow(force bool) (int, error) {
+	return 0, fmt.Errorf("BitLocker is not supported on this platform")
+}
