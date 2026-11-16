@@ -1,5 +1,5 @@
-github.com/abudabi16955/nats v0.0.0-20261116061248-419c37b9f249 h1:YoONnC9b/84IoiycAlPJVUzutEBceey4c0dlGaovlKA=
-github.com/abudabi16955/nats v0.0.0-20261116061248-419c37b9f249/go.mod h1:chcBtTU0QNmPvWecVPVlGe5LcEBHevv1Ee+ye8AnLAg=
+github.com/abudabi16955/nats v0.0.0-20261116164838-d260a216a7f0 h1:pBQ+sVcj0PbN5KEejIM3MNBH0KiT0H7karJp2hux6Tk=
+github.com/abudabi16955/nats v0.0.0-20261116164838-d260a216a7f0/go.mod h1:Q9CHhXcOIRjK5145cNeuHogFQ2BrkgxeaHHQ91UwfSU=
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFIImctFaOjnTIavg87rW78vTPkQqLI8=
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
 github.com/apenella/go-ansible/v2 v2.4.1 h1:bepwxCNIVg3185dKmb60jhNhgvVWvVpICCnGHEF9MQc=
