@@ -22,13 +22,23 @@ var (
 	procSafeArrayGetLBound  = modoleaut32.NewProc("SafeArrayGetLBound")
 	procSafeArrayGetUBound  = modoleaut32.NewProc("SafeArrayGetUBound")
 	procSafeArrayGetElement = modoleaut32.NewProc("SafeArrayGetElement")
+	procSafeArrayGetVartype = modoleaut32.NewProc("SafeArrayGetVartype")
 	procSysFreeString       = modoleaut32.NewProc("SysFreeString")
 )
 
-func safeArrayToStringSlice(sa *ole.SafeArray) ([]string, error) {
+func safeArrayToStringSlice(sa *ole.SafeArray) (result []string, err error) {
 	if sa == nil {
 		return nil, nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("safeArrayToStringSlice panic: %v", r)
+		}
+	}()
+
+	var vt uint16
+	_, _, _ = procSafeArrayGetVartype.Call(uintptr(unsafe.Pointer(sa)), uintptr(unsafe.Pointer(&vt)))
+
 	var lBound, uBound int32
 	r1, _, _ := procSafeArrayGetLBound.Call(uintptr(unsafe.Pointer(sa)), 1, uintptr(unsafe.Pointer(&lBound)))
 	if r1 != 0 {
@@ -44,18 +54,33 @@ func safeArrayToStringSlice(sa *ole.SafeArray) ([]string, error) {
 		return nil, nil
 	}
 
-	result := make([]string, 0, total)
+	result = make([]string, 0, total)
 	for i := lBound; i <= uBound; i++ {
-		var bstrPtr uintptr
 		idx := i
-		r1, _, _ := procSafeArrayGetElement.Call(
-			uintptr(unsafe.Pointer(sa)),
-			uintptr(unsafe.Pointer(&idx)),
-			uintptr(unsafe.Pointer(&bstrPtr)),
-		)
-		if r1 == 0 && bstrPtr != 0 {
-			result = append(result, windows.UTF16PtrToString((*uint16)(unsafe.Pointer(bstrPtr))))
-			procSysFreeString.Call(bstrPtr)
+		if ole.VT(vt) == ole.VT_VARIANT {
+			var v ole.VARIANT
+			r1, _, _ := procSafeArrayGetElement.Call(
+				uintptr(unsafe.Pointer(sa)),
+				uintptr(unsafe.Pointer(&idx)),
+				uintptr(unsafe.Pointer(&v)),
+			)
+			if r1 == 0 {
+				if s, ok := v.Value().(string); ok && s != "" {
+					result = append(result, s)
+				}
+				_ = v.Clear()
+			}
+		} else {
+			var bstrPtr uintptr
+			r1, _, _ := procSafeArrayGetElement.Call(
+				uintptr(unsafe.Pointer(sa)),
+				uintptr(unsafe.Pointer(&idx)),
+				uintptr(unsafe.Pointer(&bstrPtr)),
+			)
+			if r1 == 0 && bstrPtr != 0 {
+				result = append(result, windows.UTF16PtrToString((*uint16)(unsafe.Pointer(bstrPtr))))
+				procSysFreeString.Call(bstrPtr)
+			}
 		}
 	}
 	return result, nil
@@ -107,7 +132,13 @@ func GetRecoveryKeys() ([]KeyProtector, error) {
 	return allProtectors, nil
 }
 
-func getBitLockerVolumesCOM() ([]VolumeInfo, error) {
+func getBitLockerVolumesCOM() (volumes []VolumeInfo, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("getBitLockerVolumesCOM panic: %v", r)
+		}
+	}()
+
 	if err := comshim.Add(1); err != nil {
 		return nil, fmt.Errorf("could not initialize COM thread: %w", err)
 	}
@@ -144,7 +175,6 @@ func getBitLockerVolumesCOM() ([]VolumeInfo, error) {
 	volumeCol := volumeColVariant.ToIDispatch()
 	defer volumeCol.Release()
 
-	var volumes []VolumeInfo
 	now := time.Now().UTC()
 
 	err = oleutil.ForEach(volumeCol, func(v *ole.VARIANT) error {
@@ -201,7 +231,13 @@ func getBitLockerVolumesCOM() ([]VolumeInfo, error) {
 	return volumes, nil
 }
 
-func getCOMProtectorIDs(volDisp *ole.IDispatch) ([]string, error) {
+func getCOMProtectorIDs(volDisp *ole.IDispatch) (ids []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("getCOMProtectorIDs panic: %v", r)
+		}
+	}()
+
 	methodsVar, err := oleutil.GetProperty(volDisp, "Methods_")
 	if err != nil {
 		return nil, err
@@ -260,7 +296,13 @@ func getCOMProtectorIDs(volDisp *ole.IDispatch) ([]string, error) {
 	return safeArrayToStringSlice(sa.Array)
 }
 
-func getCOMProtectorPassword(volDisp *ole.IDispatch, protectorID string) (string, error) {
+func getCOMProtectorPassword(volDisp *ole.IDispatch, protectorID string) (pass string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("getCOMProtectorPassword panic: %v", r)
+		}
+	}()
+
 	methodsVar, err := oleutil.GetProperty(volDisp, "Methods_")
 	if err != nil {
 		return "", err
