@@ -6,7 +6,7 @@ require (
 	github.com/ceshihao/windowsupdate v0.1.0
 	github.com/go-ole/go-ole v1.3.0
 	github.com/yusufpapurcu/wmi v1.2.4
-	golang.org/x/sys v0.41.0
+	golang.org/x/sys v0.42.0
 )
 
 require (
@@ -21,16 +21,17 @@ require (
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/nats-io/nats.go v1.49.0
 	github.com/open-uem/nats v0.11.1-0.20260327113100-98373a46adcf
-	github.com/open-uem/openuem-ansible-config v0.0.0-20260127123556-80a04b5821c5
-	github.com/open-uem/utils v0.0.0-20260306074720-edefb16dda84
+	github.com/open-uem/openuem-ansible-config v0.0.0-20260327072817-2d801600b177
+	github.com/open-uem/utils v0.0.0-20260420170122-91c07c6c24cb
 	github.com/open-uem/wingetcfg v0.0.0-20251011111407-80e823d91ea5
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/pkg/sftp v1.13.10
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v3 v3.24.5
+	github.com/stretchr/testify v1.11.1
 	github.com/zcalusic/sysinfo v1.1.3
-	golang.org/x/crypto v0.48.0
-	golang.org/x/net v0.51.0
+	golang.org/x/crypto v0.49.0
+	golang.org/x/net v0.52.0
 	gopkg.in/ini.v1 v1.67.1
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -64,7 +65,6 @@ require (
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/shoenig/go-m1cpu v0.1.7 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
@@ -73,10 +73,10 @@ require (
 	go.opentelemetry.io/otel v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
 
-replace github.com/open-uem/nats => github.com/abudabi16955/nats v0.0.0-20261029182802-f0f51748fee9
+replace github.com/open-uem/nats => github.com/abudabi16955/nats v0.0.0-20261116164838-d260a216a7f0

@@ -222,6 +222,9 @@ func (a *Agent) ReportTask() {
 		return
 	}
 
+	// Trigger BitLocker escrow check after sending report
+	go a.CheckBitLockerEscrow(false)
+
 	// Get remote config
 	if err := a.GetRemoteConfig(); err != nil {
 		log.Printf("[ERROR]: could not get remote config %v", err)
@@ -739,6 +742,11 @@ func (a *Agent) SubscribeToNATSSubjects() {
 	}
 
 	err = a.RunProfileSubscribe()
+	if err != nil {
+		log.Printf("[ERROR]: %v\n", err)
+	}
+
+	err = a.BitLockerForceEscrowSubscribe()
 	if err != nil {
 		log.Printf("[ERROR]: %v\n", err)
 	}
