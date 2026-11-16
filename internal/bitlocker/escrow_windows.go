@@ -74,3 +74,6 @@ func ClearKeyEscrowed(keyID string) error {
 	}
 	return err
 }
+
+// ResetMockRegistry is a no-op on Windows.
+func ResetMockRegistry() {}

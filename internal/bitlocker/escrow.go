@@ -5,15 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	openuem_nats "github.com/open-uem/nats"
 )
 
+var getRecoveryKeysFunc = GetRecoveryKeys
+
 // EscrowService handles discovering BitLocker keys and escrowing them to NATS.
 type EscrowService struct {
 	nc        *nats.Conn
 	agentUUID string
+	timeout   time.Duration
 }
 
 // NewEscrowService creates a new instance of EscrowService.
@@ -21,7 +25,13 @@ func NewEscrowService(nc *nats.Conn, agentUUID string) *EscrowService {
 	return &EscrowService{
 		nc:        nc,
 		agentUUID: agentUUID,
+		timeout:   10 * time.Second,
 	}
+}
+
+// SetTimeout sets custom request timeout for testing.
+func (s *EscrowService) SetTimeout(t time.Duration) {
+	s.timeout = t
 }
 
 // CheckAndEscrowKeys retrieves recovery keys and escrows any key that hasn't been recorded yet.
@@ -31,7 +41,7 @@ func (s *EscrowService) CheckAndEscrowKeys(force bool) (int, error) {
 		return 0, errors.New("NATS connection is not ready")
 	}
 
-	keys, err := GetRecoveryKeys()
+	keys, err := getRecoveryKeysFunc()
 	if err != nil {
 		return 0, fmt.Errorf("failed to retrieve BitLocker recovery keys: %w", err)
 	}
@@ -42,6 +52,11 @@ func (s *EscrowService) CheckAndEscrowKeys(force bool) (int, error) {
 	}
 
 	escrowedCount := 0
+	timeout := s.timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
 	for _, key := range keys {
 		cleanID := CleanKeyID(key.KeyID)
 		if !force {
@@ -67,8 +82,20 @@ func (s *EscrowService) CheckAndEscrowKeys(force bool) (int, error) {
 		}
 
 		subject := openuem_nats.BitLockerEscrowSubject(s.agentUUID)
-		if err := s.nc.Publish(subject, data); err != nil {
-			log.Printf("[ERROR]: failed to publish BitLocker escrow for key %s: %v", cleanID, err)
+		respMsg, err := s.nc.Request(subject, data, timeout)
+		if err != nil {
+			log.Printf("[ERROR]: failed to request BitLocker escrow for key %s: %v", cleanID, err)
+			continue
+		}
+
+		var escrowResp openuem_nats.BitLockerEscrowResponse
+		if err := json.Unmarshal(respMsg.Data, &escrowResp); err != nil {
+			log.Printf("[ERROR]: failed to unmarshal BitLocker escrow response for key %s: %v", cleanID, err)
+			continue
+		}
+
+		if !escrowResp.Success {
+			log.Printf("[ERROR]: BitLocker escrow rejected by server for key %s: %s", cleanID, escrowResp.Error)
 			continue
 		}
 
