@@ -9,18 +9,73 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/doncicuto/comshim"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
+	"golang.org/x/sys/windows"
 )
+
+var (
+	modoleaut32             = windows.NewLazySystemDLL("oleaut32.dll")
+	procSafeArrayGetLBound  = modoleaut32.NewProc("SafeArrayGetLBound")
+	procSafeArrayGetUBound  = modoleaut32.NewProc("SafeArrayGetUBound")
+	procSafeArrayGetElement = modoleaut32.NewProc("SafeArrayGetElement")
+	procSysFreeString       = modoleaut32.NewProc("SysFreeString")
+)
+
+func safeArrayToStringSlice(sa *ole.SafeArray) ([]string, error) {
+	if sa == nil {
+		return nil, nil
+	}
+	var lBound, uBound int32
+	r1, _, _ := procSafeArrayGetLBound.Call(uintptr(unsafe.Pointer(sa)), 1, uintptr(unsafe.Pointer(&lBound)))
+	if r1 != 0 {
+		return nil, fmt.Errorf("SafeArrayGetLBound failed: %x", r1)
+	}
+	r1, _, _ = procSafeArrayGetUBound.Call(uintptr(unsafe.Pointer(sa)), 1, uintptr(unsafe.Pointer(&uBound)))
+	if r1 != 0 {
+		return nil, fmt.Errorf("SafeArrayGetUBound failed: %x", r1)
+	}
+
+	total := uBound - lBound + 1
+	if total <= 0 {
+		return nil, nil
+	}
+
+	result := make([]string, 0, total)
+	for i := lBound; i <= uBound; i++ {
+		var bstrPtr uintptr
+		idx := i
+		r1, _, _ := procSafeArrayGetElement.Call(
+			uintptr(unsafe.Pointer(sa)),
+			uintptr(unsafe.Pointer(&idx)),
+			uintptr(unsafe.Pointer(&bstrPtr)),
+		)
+		if r1 == 0 && bstrPtr != 0 {
+			result = append(result, windows.UTF16PtrToString((*uint16)(unsafe.Pointer(bstrPtr))))
+			procSysFreeString.Call(bstrPtr)
+		}
+	}
+	return result, nil
+}
 
 // GetBitLockerVolumes queries Win32_EncryptableVolume from Root\CIMv2\Security\MicrosoftVolumeEncryption using go-ole.
 // If go-ole encounters an issue or returns no volumes, it attempts the PowerShell CIM fallback.
 func GetBitLockerVolumes() ([]VolumeInfo, error) {
 	vols, err := getBitLockerVolumesCOM()
 	if err == nil && len(vols) > 0 {
-		return vols, nil
+		hasProtectors := false
+		for _, v := range vols {
+			if len(v.Protectors) > 0 {
+				hasProtectors = true
+				break
+			}
+		}
+		if hasProtectors {
+			return vols, nil
+		}
 	}
 	if err != nil {
 		log.Printf("[DEBUG]: BitLocker COM query error: %v, attempting PowerShell CIM fallback", err)
@@ -98,25 +153,14 @@ func getBitLockerVolumesCOM() ([]VolumeInfo, error) {
 
 		driveLetter := ""
 		driveLetterVar, err := oleutil.GetProperty(volDisp, "DriveLetter")
-		if err == nil && driveLetterVar.Value() != nil {
-			driveLetter = strings.TrimSpace(driveLetterVar.ToString())
+		if err == nil && driveLetterVar.VT != ole.VT_NULL && driveLetterVar.VT != ole.VT_EMPTY {
+			driveLetter = driveLetterVar.ToString()
 		}
 
 		protStatus := 0
 		protStatusVar, err := oleutil.GetProperty(volDisp, "ProtectionStatus")
-		if err == nil && protStatusVar.Value() != nil {
-			switch val := protStatusVar.Value().(type) {
-			case int32:
-				protStatus = int(val)
-			case uint32:
-				protStatus = int(val)
-			case int64:
-				protStatus = int(val)
-			case uint64:
-				protStatus = int(val)
-			case int:
-				protStatus = val
-			}
+		if err == nil && protStatusVar.VT != ole.VT_NULL && protStatusVar.VT != ole.VT_EMPTY {
+			protStatus = int(protStatusVar.Val)
 		}
 
 		volInfo := VolumeInfo{
@@ -213,7 +257,7 @@ func getCOMProtectorIDs(volDisp *ole.IDispatch) ([]string, error) {
 	}
 	defer sa.Release()
 
-	return sa.ToStringArray(), nil
+	return safeArrayToStringSlice(sa.Array)
 }
 
 func getCOMProtectorPassword(volDisp *ole.IDispatch, protectorID string) (string, error) {
