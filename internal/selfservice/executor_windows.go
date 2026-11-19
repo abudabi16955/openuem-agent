@@ -19,6 +19,9 @@ import (
 )
 
 var (
+	modadvapi32                 = windows.NewLazySystemDLL("advapi32.dll")
+	procCreateProcessWithTokenW = modadvapi32.NewProc("CreateProcessWithTokenW")
+
 	modwtsapi32           = windows.NewLazySystemDLL("wtsapi32.dll")
 	procWTSQueryUserToken = modwtsapi32.NewProc("WTSQueryUserToken")
 
@@ -283,42 +286,124 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 	// 3. Create environment block for duplicated token
 	var envBlock *uint16
 	r1, _, errEnv := procCreateEnvironmentBlock.Call(uintptr(unsafe.Pointer(&envBlock)), uintptr(primaryToken), 0)
-	var userEnv []string
 	if r1 != 0 && envBlock != nil {
 		defer procDestroyEnvironmentBlock.Call(uintptr(unsafe.Pointer(envBlock)))
-		userEnv = parseEnvBlock(envBlock)
 	} else {
 		log.Printf("[WARN]: CreateEnvironmentBlock failed: %v", errEnv)
+		envBlock = nil
 	}
 
-	// 4. Execute command using user token and environment
-	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, cmdPath, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Token:         syscall.Token(primaryToken),
-		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT,
-	}
-	if len(userEnv) > 0 {
-		cmd.Env = userEnv
+	// 4. Prepare command line
+	cmdLineArgs := append([]string{cmdPath}, args...)
+	cmdLineStr := windows.ComposeCommandLine(cmdLineArgs)
+	cmdLine16, err := windows.UTF16PtrFromString(cmdLineStr)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode command line: %w", err)
 	}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// 5. Create pipe for stdout/stderr with permissive DACL
+	sd, err := windows.SecurityDescriptorFromString("D:(A;;GA;;;WD)")
+	if err != nil {
+		return "", fmt.Errorf("failed to create security descriptor: %w", err)
+	}
+	sa := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		InheritHandle:      1,
+		SecurityDescriptor: sd,
+	}
 
-	runErr := cmd.Run()
-	output := stdout.String()
-	if stderr.Len() > 0 {
-		if output != "" {
-			output += "\n"
+	var readPipe, writePipe windows.Handle
+	if err := windows.CreatePipe(&readPipe, &writePipe, &sa, 0); err != nil {
+		return "", fmt.Errorf("failed to create pipe: %w", err)
+	}
+	defer windows.CloseHandle(readPipe)
+	_ = windows.SetHandleInformation(readPipe, windows.HANDLE_FLAG_INHERIT, 0)
+
+	// 6. Setup STARTUPINFO and PROCESS_INFORMATION
+	si := windows.StartupInfo{
+		Cb:         uint32(unsafe.Sizeof(windows.StartupInfo{})),
+		Flags:      windows.STARTF_USESTDHANDLES | windows.STARTF_USESHOWWINDOW,
+		ShowWindow: windows.SW_HIDE,
+		StdOutput:  writePipe,
+		StdErr:     writePipe,
+	}
+	var pi windows.ProcessInformation
+
+	creationFlags := uint32(windows.CREATE_NO_WINDOW)
+	var envPtr uintptr
+	if envBlock != nil {
+		creationFlags |= windows.CREATE_UNICODE_ENVIRONMENT
+		envPtr = uintptr(unsafe.Pointer(envBlock))
+	}
+
+	// 7. Launch process using CreateProcessWithTokenW
+	ret, _, procErr := procCreateProcessWithTokenW.Call(
+		uintptr(primaryToken),
+		0,
+		0,
+		uintptr(unsafe.Pointer(cmdLine16)),
+		uintptr(creationFlags),
+		envPtr,
+		0,
+		uintptr(unsafe.Pointer(&si)),
+		uintptr(unsafe.Pointer(&pi)),
+	)
+	// Immediately close the write end of the pipe in the parent process
+	_ = windows.CloseHandle(writePipe)
+
+	if ret == 0 {
+		return "", fmt.Errorf("CreateProcessWithTokenW failed: %v", procErr)
+	}
+	defer windows.CloseHandle(pi.Process)
+	defer windows.CloseHandle(pi.Thread)
+
+	// 8. Concurrently read output from pipe until EOF
+	var outBuf bytes.Buffer
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 4096)
+		for {
+			var bytesRead uint32
+			err := windows.ReadFile(readPipe, buf, &bytesRead, nil)
+			if bytesRead > 0 {
+				outBuf.Write(buf[:bytesRead])
+			}
+			if err != nil {
+				break
+			}
 		}
-		output += stderr.String()
+	}()
+
+	// 9. Wait for process completion with timeout
+	timeoutMs := uint32(windows.INFINITE)
+	if e.timeout > 0 {
+		timeoutMs = uint32(e.timeout / time.Millisecond)
 	}
 
-	if runErr != nil {
-		return output, fmt.Errorf("user command execution failed (%w): %s", runErr, output)
+	event, waitErr := windows.WaitForSingleObject(pi.Process, timeoutMs)
+	if waitErr != nil {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		<-readDone
+		return outBuf.String(), fmt.Errorf("WaitForSingleObject failed: %w", waitErr)
 	}
+	if event == uint32(windows.WAIT_TIMEOUT) {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		<-readDone
+		return outBuf.String(), fmt.Errorf("user command execution timed out after %v", e.timeout)
+	}
+
+	<-readDone
+
+	var exitCode uint32
+	if err := windows.GetExitCodeProcess(pi.Process, &exitCode); err != nil {
+		return outBuf.String(), fmt.Errorf("failed to get exit code: %w", err)
+	}
+
+	output := outBuf.String()
+	if exitCode != 0 {
+		return output, fmt.Errorf("user command execution failed (exit status %d): %s", exitCode, output)
+	}
+
 	return output, nil
 }
