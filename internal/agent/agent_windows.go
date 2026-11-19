@@ -26,6 +26,7 @@ import (
 	openuem_nats "github.com/open-uem/nats"
 	"github.com/open-uem/openuem-agent/internal/agent/dsc"
 	"github.com/open-uem/openuem-agent/internal/bitlocker"
+	"github.com/open-uem/openuem-agent/internal/selfservice"
 	"github.com/open-uem/openuem-agent/internal/commands/deploy"
 	rd "github.com/open-uem/openuem-agent/internal/commands/remote-desktop"
 	"github.com/open-uem/openuem-agent/internal/commands/report"
@@ -105,6 +106,7 @@ func (a *Agent) Start() {
 	}
 	a.SubscribeToNATSSubjects()
 	go a.CheckBitLockerEscrow(false)
+	a.StartSelfService()
 
 	// Run report for the first time after start if agent is enabled
 	if a.Config.Enabled {
@@ -163,6 +165,11 @@ func (a *Agent) startNATSConnectJob() error {
 				a.TaskScheduler.RemoveJob(a.NATSConnectJob.ID())
 				a.SubscribeToNATSSubjects()
 				go a.CheckBitLockerEscrow(false)
+				if a.SelfService != nil {
+					a.SelfService.UpdateNATSConnection(a.NATSConnection)
+				} else {
+					a.StartSelfService()
+				}
 
 				// Start the rest of tasks
 				a.startReportJob()
@@ -2280,4 +2287,30 @@ func (a *Agent) PerformBitLockerEscrow(force bool) (int, error) {
 	}
 	svc := bitlocker.NewEscrowService(a.NATSConnection, a.Config.UUID)
 	return svc.CheckAndEscrowKeys(force)
+}
+
+func (a *Agent) StartSelfService() {
+	selfServiceCfg := selfservice.ServiceConfig{
+		AgentCert:     a.Config.AgentCert,
+		AgentKey:      a.Config.AgentKey,
+		CACert:        a.Config.CACert,
+		NATSConn:      a.NATSConnection,
+		AgentUUID:     a.Config.UUID,
+		RefreshReport: func() {
+			if a.Config.Enabled {
+				if r := a.RunReport(); r != nil {
+					_ = a.SendReport(r)
+				}
+			}
+		},
+	}
+	ss, err := selfservice.NewService(selfServiceCfg)
+	if err != nil {
+		log.Printf("[ERROR]: could not initialize selfservice service: %v", err)
+		return
+	}
+	a.SelfService = ss
+	if err := a.SelfService.Start(); err != nil {
+		log.Printf("[ERROR]: could not start selfservice service: %v", err)
+	}
 }
