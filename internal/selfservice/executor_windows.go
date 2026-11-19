@@ -19,9 +19,8 @@ import (
 )
 
 var (
-	modwtsapi32                      = windows.NewLazySystemDLL("wtsapi32.dll")
-	procWTSQueryUserToken            = modwtsapi32.NewProc("WTSQueryUserToken")
-	procWTSGetActiveConsoleSessionId = modwtsapi32.NewProc("WTSGetActiveConsoleSessionId")
+	modwtsapi32           = windows.NewLazySystemDLL("wtsapi32.dll")
+	procWTSQueryUserToken = modwtsapi32.NewProc("WTSQueryUserToken")
 
 	moduserenv                  = windows.NewLazySystemDLL("userenv.dll")
 	procCreateEnvironmentBlock  = moduserenv.NewProc("CreateEnvironmentBlock")
@@ -235,11 +234,11 @@ func getUserTokenFromProcess(name string, targetSessionID uint32) (windows.Token
 // acquireUserToken attempts to acquire a user token first via active console session (WTSQueryUserToken),
 // and falls back to inspecting the explorer.exe process token if WTS is unavailable or fails.
 func acquireUserToken() (windows.Token, error) {
-	// 1. Get active console session ID via WTSGetActiveConsoleSessionId
-	sessionID, _, _ := procWTSGetActiveConsoleSessionId.Call()
+	// 1. Get active console session ID via windows.WTSGetActiveConsoleSessionId
+	sessionID := windows.WTSGetActiveConsoleSessionId()
 	if sessionID != 0xFFFFFFFF {
 		var userToken windows.Token
-		r1, _, err := procWTSQueryUserToken.Call(sessionID, uintptr(unsafe.Pointer(&userToken)))
+		r1, _, err := procWTSQueryUserToken.Call(uintptr(sessionID), uintptr(unsafe.Pointer(&userToken)))
 		if r1 != 0 && userToken != 0 {
 			return userToken, nil
 		}
@@ -249,7 +248,7 @@ func acquireUserToken() (windows.Token, error) {
 	}
 
 	// 2. Fallback: query user token from explorer.exe process
-	token, err := getUserTokenFromProcess("explorer.exe", uint32(sessionID))
+	token, err := getUserTokenFromProcess("explorer.exe", sessionID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to acquire user token (WTS session unavailable and process fallback failed: %w)", err)
 	}
