@@ -21,6 +21,7 @@ import (
 var (
 	modadvapi32                 = windows.NewLazySystemDLL("advapi32.dll")
 	procCreateProcessWithTokenW = modadvapi32.NewProc("CreateProcessWithTokenW")
+	procSetSecurityInfo         = modadvapi32.NewProc("SetSecurityInfo")
 
 	modwtsapi32           = windows.NewLazySystemDLL("wtsapi32.dll")
 	procWTSQueryUserToken = modwtsapi32.NewProc("WTSQueryUserToken")
@@ -28,6 +29,13 @@ var (
 	moduserenv                  = windows.NewLazySystemDLL("userenv.dll")
 	procCreateEnvironmentBlock  = moduserenv.NewProc("CreateEnvironmentBlock")
 	procDestroyEnvironmentBlock = moduserenv.NewProc("DestroyEnvironmentBlock")
+
+	moduser32                   = windows.NewLazySystemDLL("user32.dll")
+	procOpenWindowStationW      = moduser32.NewProc("OpenWindowStationW")
+	procSetProcessWindowStation = moduser32.NewProc("SetProcessWindowStation")
+	procCloseWindowStation      = moduser32.NewProc("CloseWindowStation")
+	procOpenDesktopW            = moduser32.NewProc("OpenDesktopW")
+	procCloseDesktop            = moduser32.NewProc("CloseDesktop")
 )
 
 // WindowsExecutor implements package installation execution on Windows.
@@ -258,7 +266,35 @@ func acquireUserToken() (windows.Token, error) {
 	return token, nil
 }
 
+// grantDesktopAccess grants full access to WinSta0 window station and Default desktop
+// so that user processes launched from Session 0 (which link to user32.dll) can initialize.
+func grantDesktopAccess() {
+	w16, err := windows.UTF16PtrFromString("WinSta0")
+	if err != nil {
+		return
+	}
+	hW0, _, _ := procOpenWindowStationW.Call(uintptr(unsafe.Pointer(w16)), 0, windows.GENERIC_ALL)
+	if hW0 != 0 {
+		defer procCloseWindowStation.Call(hW0)
+		// Ustawienie NULL DACL (SE_WINDOW_OBJECT=7, DACL_SECURITY_INFORMATION=4) daje pelny dostep procesom w sesji
+		procSetSecurityInfo.Call(hW0, 7, 4, 0, 0, 0, 0, 0)
+		procSetProcessWindowStation.Call(hW0)
+
+		d16, err := windows.UTF16PtrFromString("Default")
+		if err == nil {
+			hD0, _, _ := procOpenDesktopW.Call(uintptr(unsafe.Pointer(d16)), 0, 0, windows.GENERIC_ALL)
+			if hD0 != 0 {
+				defer procCloseDesktop.Call(hD0)
+				procSetSecurityInfo.Call(hD0, 7, 4, 0, 0, 0, 0, 0)
+			}
+		}
+	}
+}
+
 func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, error) {
+	// Grant access to WinSta0 and Default desktop for Session 0 -> interactive session transition
+	grantDesktopAccess()
+
 	// 1. Acquire user token (via WTS or fallback to explorer.exe)
 	userToken, err := acquireUserToken()
 	if err != nil {
@@ -324,6 +360,7 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 		Cb:         uint32(unsafe.Sizeof(windows.StartupInfo{})),
 		Flags:      windows.STARTF_USESTDHANDLES | windows.STARTF_USESHOWWINDOW,
 		ShowWindow: windows.SW_HIDE,
+		Desktop:    windows.StringToUTF16Ptr("WinSta0\\Default"),
 		StdOutput:  writePipe,
 		StdErr:     writePipe,
 	}
