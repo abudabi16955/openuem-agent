@@ -180,7 +180,11 @@ func (s *IPCServer) handleConnection(handle windows.Handle) {
 	// S-13: Extract client identity directly from the active Named Pipe connection
 	// ImpersonateNamedPipeClient requires data to be read from the pipe first (ERROR_CANNOT_IMPERSONATE / 1368).
 	if token, err := extractClientToken(handle); err == nil {
-		SetActiveUserToken(token)
+		if isNonSystemUserToken(token) {
+			SetActiveUserToken(token)
+		} else {
+			token.Close()
+		}
 	} else {
 		log.Printf("[WARN]: failed to extract user token from named pipe client: %v", err)
 	}
@@ -300,4 +304,17 @@ func CallIPC(pipeName string, req IPCRequest) (*IPCResponse, error) {
 	}
 
 	return &resp, nil
+}
+
+func isNonSystemUserToken(token windows.Token) bool {
+	u, err := token.GetTokenUser()
+	if err != nil || u.User.Sid == nil {
+		return false
+	}
+	sid := u.User.Sid.String()
+	// S-1-5-18: LocalSystem, S-1-5-19: LocalService, S-1-5-20: NetworkService
+	if sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20" {
+		return false
+	}
+	return true
 }
