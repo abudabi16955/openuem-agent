@@ -25,16 +25,17 @@ type ServiceConfig struct {
 
 // Service manages all self-service portal functionality inside openuem-agent.
 type Service struct {
-	config      ServiceConfig
-	catalogMgr  *CatalogManager
-	downloader  *Downloader
-	executor    Executor
-	reporter    DeployReporter
-	queue       *InstallationQueue
-	ipcServer   *IPCServer
-	natsSub     *nats.Subscription
-	pruneTicker *time.Ticker
-	quitChan    chan struct{}
+	config         ServiceConfig
+	catalogMgr     *CatalogManager
+	downloader     *Downloader
+	executor       Executor
+	reporter       DeployReporter
+	queue          *InstallationQueue
+	installedStore *InstalledStore
+	ipcServer      *IPCServer
+	natsSub        *nats.Subscription
+	pruneTicker    *time.Ticker
+	quitChan       chan struct{}
 }
 
 // NewService creates a new SelfService service instance.
@@ -46,6 +47,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	catalogMgr, err := NewCatalogManager(cfg.BaseDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init catalog manager: %w", err)
+	}
+
+	installedStore, err := NewInstalledStore(filepath.Join(cfg.BaseDir, "installed_packages.json"))
+	if err != nil {
+		log.Printf("[WARN]: failed to init installed store: %v", err)
 	}
 
 	// Setup mTLS client for package downloads if certificates exist
@@ -75,20 +81,21 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	executor := NewWindowsExecutor(30 * time.Minute)
 	reporter := NewNATSReporter(cfg.NATSConn, cfg.RefreshReport)
 
-	queue := NewInstallationQueue(downloader, executor, reporter, cfg.AgentUUID, cfg.ConsoleBaseURL)
-	dispatcher := NewIPCDispatcher(catalogMgr, queue)
+	queue := NewInstallationQueue(downloader, executor, reporter, cfg.AgentUUID, cfg.ConsoleBaseURL, installedStore)
+	dispatcher := NewIPCDispatcher(catalogMgr, queue, installedStore)
 	ipcServer := NewIPCServer("", dispatcher)
 
 	return &Service{
-		config:      cfg,
-		catalogMgr:  catalogMgr,
-		downloader:  downloader,
-		executor:    executor,
-		reporter:    reporter,
-		queue:       queue,
-		ipcServer:   ipcServer,
-		quitChan:    make(chan struct{}),
-		pruneTicker: time.NewTicker(24 * time.Hour),
+		config:         cfg,
+		catalogMgr:     catalogMgr,
+		downloader:     downloader,
+		executor:       executor,
+		reporter:       reporter,
+		queue:          queue,
+		installedStore: installedStore,
+		ipcServer:      ipcServer,
+		quitChan:       make(chan struct{}),
+		pruneTicker:    time.NewTicker(24 * time.Hour),
 	}, nil
 }
 

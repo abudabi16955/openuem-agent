@@ -3,9 +3,12 @@
 package selfservice
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"unicode/utf16"
+
+	"golang.org/x/sys/windows"
 )
 
 func createUTF16Block(vars []string) []uint16 {
@@ -98,5 +101,17 @@ func TestParseEnvBlock(t *testing.T) {
 				t.Fatalf("parseEnvBlock mismatch:\ngot:  %v\nwant: %v", got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestGrantUserReadAndExecute_SDDL(t *testing.T) {
+	sddl := fmt.Sprintf("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;%s)", "S-1-5-18")
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatalf("failed to parse SDDL: %v", err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		t.Fatalf("failed to get DACL: %v", err)
 	}
 }

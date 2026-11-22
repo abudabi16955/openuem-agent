@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -21,22 +22,48 @@ import (
 var (
 	modadvapi32                 = windows.NewLazySystemDLL("advapi32.dll")
 	procCreateProcessWithTokenW = modadvapi32.NewProc("CreateProcessWithTokenW")
-	procSetSecurityInfo         = modadvapi32.NewProc("SetSecurityInfo")
-
-	modwtsapi32           = windows.NewLazySystemDLL("wtsapi32.dll")
-	procWTSQueryUserToken = modwtsapi32.NewProc("WTSQueryUserToken")
 
 	moduserenv                  = windows.NewLazySystemDLL("userenv.dll")
 	procCreateEnvironmentBlock  = moduserenv.NewProc("CreateEnvironmentBlock")
 	procDestroyEnvironmentBlock = moduserenv.NewProc("DestroyEnvironmentBlock")
 
-	moduser32                   = windows.NewLazySystemDLL("user32.dll")
-	procOpenWindowStationW      = moduser32.NewProc("OpenWindowStationW")
-	procSetProcessWindowStation = moduser32.NewProc("SetProcessWindowStation")
-	procCloseWindowStation      = moduser32.NewProc("CloseWindowStation")
-	procOpenDesktopW            = moduser32.NewProc("OpenDesktopW")
-	procCloseDesktop            = moduser32.NewProc("CloseDesktop")
+	activeTokenMu   sync.RWMutex
+	activeUserToken windows.Token
 )
+
+// SetActiveUserToken stores a duplicate of the primary user token obtained directly from the IPC connection (S-13).
+func SetActiveUserToken(token windows.Token) {
+	activeTokenMu.Lock()
+	defer activeTokenMu.Unlock()
+	if activeUserToken != 0 {
+		_ = activeUserToken.Close()
+	}
+	activeUserToken = token
+}
+
+// GetActiveUserToken returns a duplicated handle to the active user token obtained via Named Pipe IPC (S-13).
+func GetActiveUserToken() (windows.Token, error) {
+	activeTokenMu.RLock()
+	defer activeTokenMu.RUnlock()
+
+	if activeUserToken == 0 {
+		return 0, fmt.Errorf("no active user token available from IPC client (runAsUser requires an active Named Pipe session)")
+	}
+
+	var dup windows.Token
+	err := windows.DuplicateTokenEx(
+		activeUserToken,
+		windows.MAXIMUM_ALLOWED,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenPrimary,
+		&dup,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to duplicate active user token: %w", err)
+	}
+	return dup, nil
+}
 
 // WindowsExecutor implements package installation execution on Windows.
 type WindowsExecutor struct {
@@ -51,6 +78,25 @@ func NewWindowsExecutor(timeout time.Duration) *WindowsExecutor {
 	return &WindowsExecutor{timeout: timeout}
 }
 
+// prepareUserPermissions grants Read & Execute permissions to the user's SID (S-14).
+func (e *WindowsExecutor) prepareUserPermissions(path string) {
+	token, err := GetActiveUserToken()
+	if err != nil {
+		return
+	}
+	defer token.Close()
+
+	user, err := token.GetTokenUser()
+	if err != nil || user.User.Sid == nil {
+		return
+	}
+	userSID := user.User.Sid.String()
+
+	dir := filepath.Dir(path)
+	_ = GrantUserReadAndExecute(dir, userSID)
+	_ = GrantUserReadAndExecute(path, userSID)
+}
+
 // Execute executes a package installation based on its PackageType and ExecContext.
 func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, error) {
 	pkgType := strings.ToLower(strings.TrimSpace(pkg.PackageType))
@@ -61,10 +107,16 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, er
 
 	switch pkgType {
 	case "msi":
+		if execContext == "user" && localPath != "" {
+			e.prepareUserPermissions(localPath)
+		}
 		args := BuildMSIArgs(localPath, pkg.SilentArgs)
 		return e.runCommand("msiexec.exe", args, execContext)
 
 	case "exe":
+		if execContext == "user" && localPath != "" {
+			e.prepareUserPermissions(localPath)
+		}
 		args := BuildCustomArgs(pkg.SilentArgs)
 		return e.runCommand(localPath, args, execContext)
 
@@ -84,6 +136,11 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, er
 		exePath, err := LocateExecutableInDir(scratchDir)
 		if err != nil {
 			return "", err
+		}
+
+		if execContext == "user" {
+			e.prepareUserPermissions(scratchDir)
+			e.prepareUserPermissions(exePath)
 		}
 
 		if strings.EqualFold(filepath.Ext(exePath), ".msi") {
@@ -177,149 +234,20 @@ func parseEnvBlock(block *uint16) []string {
 	return env
 }
 
-// getUserTokenFromProcess finds a process by name (e.g. explorer.exe) and retrieves its token.
-// If targetSessionID != 0xFFFFFFFF, it prefers a process running in that session.
-func getUserTokenFromProcess(name string, targetSessionID uint32) (windows.Token, error) {
-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		return 0, fmt.Errorf("CreateToolhelp32Snapshot failed: %w", err)
-	}
-	defer windows.CloseHandle(snapshot)
-
-	var entry windows.ProcessEntry32
-	entry.Size = uint32(unsafe.Sizeof(entry))
-	err = windows.Process32First(snapshot, &entry)
-	if err != nil {
-		return 0, fmt.Errorf("Process32First failed: %w", err)
-	}
-
-	var fallbackPID uint32
-	var matchedPID uint32
-
-	for {
-		if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), name) {
-			var sessID uint32
-			if errSess := windows.ProcessIdToSessionId(entry.ProcessID, &sessID); errSess == nil {
-				if targetSessionID != 0xFFFFFFFF && sessID == targetSessionID {
-					matchedPID = entry.ProcessID
-					break
-				}
-				if sessID != 0 && fallbackPID == 0 {
-					fallbackPID = entry.ProcessID
-				}
-			} else if fallbackPID == 0 {
-				fallbackPID = entry.ProcessID
-			}
-		}
-		err = windows.Process32Next(snapshot, &entry)
-		if err != nil {
-			break
-		}
-	}
-
-	selectedPID := matchedPID
-	if selectedPID == 0 {
-		selectedPID = fallbackPID
-	}
-	if selectedPID == 0 {
-		return 0, fmt.Errorf("process %s not found in active sessions", name)
-	}
-
-	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, selectedPID)
-	if err != nil {
-		return 0, fmt.Errorf("OpenProcess failed for pid %d: %w", selectedPID, err)
-	}
-	defer windows.CloseHandle(hProc)
-
-	var token windows.Token
-	err = windows.OpenProcessToken(hProc, windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &token)
-	if err != nil {
-		err = windows.OpenProcessToken(hProc, windows.TOKEN_ALL_ACCESS, &token)
-		if err != nil {
-			return 0, fmt.Errorf("OpenProcessToken failed for pid %d: %w", selectedPID, err)
-		}
-	}
-	return token, nil
-}
-
-// acquireUserToken attempts to acquire a user token first via active console session (WTSQueryUserToken),
-// and falls back to inspecting the explorer.exe process token if WTS is unavailable or fails.
-func acquireUserToken() (windows.Token, error) {
-	// 1. Get active console session ID via windows.WTSGetActiveConsoleSessionId
-	sessionID := windows.WTSGetActiveConsoleSessionId()
-	if sessionID != 0xFFFFFFFF {
-		var userToken windows.Token
-		r1, _, err := procWTSQueryUserToken.Call(uintptr(sessionID), uintptr(unsafe.Pointer(&userToken)))
-		if r1 != 0 && userToken != 0 {
-			return userToken, nil
-		}
-		log.Printf("[WARN]: WTSQueryUserToken failed for session %d: %v, falling back to process token lookup", sessionID, err)
-	} else {
-		log.Println("[WARN]: no active console session found via WTSGetActiveConsoleSessionId, falling back to process token lookup")
-	}
-
-	// 2. Fallback: query user token from explorer.exe process
-	token, err := getUserTokenFromProcess("explorer.exe", sessionID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to acquire user token (WTS session unavailable and process fallback failed: %w)", err)
-	}
-	return token, nil
-}
-
-// grantDesktopAccess grants full access to WinSta0 window station and Default desktop
-// so that user processes launched from Session 0 (which link to user32.dll) can initialize.
-func grantDesktopAccess() {
-	w16, err := windows.UTF16PtrFromString("WinSta0")
-	if err != nil {
-		return
-	}
-	hW0, _, _ := procOpenWindowStationW.Call(uintptr(unsafe.Pointer(w16)), 0, windows.GENERIC_ALL)
-	if hW0 != 0 {
-		defer procCloseWindowStation.Call(hW0)
-		// Ustawienie NULL DACL (SE_WINDOW_OBJECT=7, DACL_SECURITY_INFORMATION=4) daje pelny dostep procesom w sesji
-		procSetSecurityInfo.Call(hW0, 7, 4, 0, 0, 0, 0, 0)
-		procSetProcessWindowStation.Call(hW0)
-
-		d16, err := windows.UTF16PtrFromString("Default")
-		if err == nil {
-			hD0, _, _ := procOpenDesktopW.Call(uintptr(unsafe.Pointer(d16)), 0, 0, windows.GENERIC_ALL)
-			if hD0 != 0 {
-				defer procCloseDesktop.Call(hD0)
-				procSetSecurityInfo.Call(hD0, 7, 4, 0, 0, 0, 0, 0)
-			}
-		}
-	}
-}
-
 func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, error) {
-	// Grant access to WinSta0 and Default desktop for Session 0 -> interactive session transition
-	grantDesktopAccess()
-
-	// 1. Acquire user token (via WTS or fallback to explorer.exe)
-	userToken, err := acquireUserToken()
+	// 1. Acquire user token directly from IPC Named Pipe client connection (S-13)
+	primaryToken, err := GetActiveUserToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to acquire user token: %w", err)
 	}
-	defer userToken.Close()
+	defer primaryToken.Close()
 
-	// 2. Duplicate token to Primary token
-	var primaryToken windows.Token
-	err = windows.DuplicateTokenEx(
-		userToken,
-		windows.MAXIMUM_ALLOWED,
-		nil,
-		windows.SecurityImpersonation,
-		windows.TokenPrimary,
-		&primaryToken,
-	)
-	if err != nil {
-		log.Printf("[WARN]: DuplicateTokenEx failed: %v, falling back to original token", err)
-		primaryToken = userToken
-	} else {
-		defer primaryToken.Close()
+	// Grant Read & Execute permissions if cmdPath is a local file (S-14)
+	if fi, err := os.Stat(cmdPath); err == nil && !fi.IsDir() {
+		e.prepareUserPermissions(cmdPath)
 	}
 
-	// 3. Create environment block for duplicated token
+	// 2. Create environment block for user token
 	var envBlock *uint16
 	r1, _, errEnv := procCreateEnvironmentBlock.Call(uintptr(unsafe.Pointer(&envBlock)), uintptr(primaryToken), 0)
 	if r1 != 0 && envBlock != nil {
@@ -329,7 +257,7 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 		envBlock = nil
 	}
 
-	// 4. Prepare command line
+	// 3. Prepare command line
 	cmdLineArgs := append([]string{cmdPath}, args...)
 	cmdLineStr := windows.ComposeCommandLine(cmdLineArgs)
 	cmdLine16, err := windows.UTF16PtrFromString(cmdLineStr)
@@ -337,7 +265,7 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 		return "", fmt.Errorf("failed to encode command line: %w", err)
 	}
 
-	// 5. Create pipe for stdout/stderr with permissive DACL
+	// 4. Create pipe for stdout/stderr with permissive DACL
 	sd, err := windows.SecurityDescriptorFromString("D:(A;;GA;;;WD)")
 	if err != nil {
 		return "", fmt.Errorf("failed to create security descriptor: %w", err)
@@ -355,12 +283,11 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 	defer windows.CloseHandle(readPipe)
 	_ = windows.SetHandleInformation(readPipe, windows.HANDLE_FLAG_INHERIT, 0)
 
-	// 6. Setup STARTUPINFO and PROCESS_INFORMATION
+	// 5. Setup STARTUPINFO and PROCESS_INFORMATION without modifying WinSta0 DACL (S-11, S-12)
 	si := windows.StartupInfo{
 		Cb:         uint32(unsafe.Sizeof(windows.StartupInfo{})),
 		Flags:      windows.STARTF_USESTDHANDLES | windows.STARTF_USESHOWWINDOW,
 		ShowWindow: windows.SW_HIDE,
-		Desktop:    windows.StringToUTF16Ptr("WinSta0\\Default"),
 		StdOutput:  writePipe,
 		StdErr:     writePipe,
 	}
@@ -373,10 +300,12 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 		envPtr = uintptr(unsafe.Pointer(envBlock))
 	}
 
-	// 7. Launch process using CreateProcessWithTokenW
+	// 6. Launch process using CreateProcessWithTokenW with LOGON_WITH_PROFILE (value 1) (S-13)
+	const LOGON_WITH_PROFILE = 1
+
 	ret, _, procErr := procCreateProcessWithTokenW.Call(
 		uintptr(primaryToken),
-		0,
+		uintptr(LOGON_WITH_PROFILE),
 		0,
 		uintptr(unsafe.Pointer(cmdLine16)),
 		uintptr(creationFlags),
@@ -385,7 +314,6 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 		uintptr(unsafe.Pointer(&si)),
 		uintptr(unsafe.Pointer(&pi)),
 	)
-	// Immediately close the write end of the pipe in the parent process
 	_ = windows.CloseHandle(writePipe)
 
 	if ret == 0 {
@@ -394,7 +322,7 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 	defer windows.CloseHandle(pi.Process)
 	defer windows.CloseHandle(pi.Thread)
 
-	// 8. Concurrently read output from pipe until EOF
+	// 7. Concurrently read output from pipe until EOF
 	var outBuf bytes.Buffer
 	readDone := make(chan struct{})
 	go func() {
@@ -412,7 +340,7 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 		}
 	}()
 
-	// 9. Wait for process completion with timeout
+	// 8. Wait for process completion with timeout
 	timeoutMs := uint32(windows.INFINITE)
 	if e.timeout > 0 {
 		timeoutMs = uint32(e.timeout / time.Millisecond)

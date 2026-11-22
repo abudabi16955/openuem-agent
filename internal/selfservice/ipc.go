@@ -28,15 +28,22 @@ type IPCResponse struct {
 
 // IPCDispatcher handles and validates incoming IPC requests.
 type IPCDispatcher struct {
-	catalogMgr *CatalogManager
-	queue      *InstallationQueue
+	catalogMgr     *CatalogManager
+	queue          *InstallationQueue
+	installedStore *InstalledStore
 }
 
 // NewIPCDispatcher creates a new IPC dispatcher.
-func NewIPCDispatcher(catalogMgr *CatalogManager, queue *InstallationQueue) *IPCDispatcher {
+func NewIPCDispatcher(catalogMgr *CatalogManager, queue *InstallationQueue, store ...*InstalledStore) *IPCDispatcher {
+	var s *InstalledStore
+	if len(store) > 0 {
+		s = store[0]
+	}
+
 	return &IPCDispatcher{
-		catalogMgr: catalogMgr,
-		queue:      queue,
+		catalogMgr:     catalogMgr,
+		queue:          queue,
+		installedStore: s,
 	}
 }
 
@@ -60,6 +67,9 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest) IPCResponse {
 	switch req.Action {
 	case "get_catalog":
 		cat := d.catalogMgr.GetCatalog()
+		for i := range cat.Packages {
+			cat.Packages[i].InstalledVersion = DetectInstalledVersion(cat.Packages[i], d.installedStore)
+		}
 		return IPCResponse{
 			Success: true,
 			Catalog: &cat,

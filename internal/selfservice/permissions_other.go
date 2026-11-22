@@ -27,3 +27,8 @@ func SetCacheExclusivePermissions(path string) error {
 	}
 	return os.Chmod(path, 0600)
 }
+
+// GrantUserReadAndExecute sets POSIX 0755 for directory or 0644 for file on non-Windows.
+func GrantUserReadAndExecute(path string, userSID string) error {
+	return SetStrictSystemAdminPermissions(path)
+}

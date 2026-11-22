@@ -4,14 +4,59 @@ let pendingInstalls = new Set();
 let selectedCategory = "all";
 let searchQuery = "";
 
+// S-15: Retrieve session auth token injected by local TrayServer
+const apiToken = document.querySelector('meta[name="openuem-token"]')?.getAttribute('content') || '';
+
+function authHeaders(extraHeaders = {}) {
+  const headers = { ...extraHeaders };
+  if (apiToken) {
+    headers['Authorization'] = `Bearer ${apiToken}`;
+  }
+  return headers;
+}
+
 const statusLabels = {
   available: "Dostępny",
   queued: "W kolejce",
   downloading: "Pobieranie",
   installing: "Instalowanie",
-  installed: "Zainstalowany",
+  installed: "Aktualna",
   failed: "Błąd"
 };
+
+// Compare two version strings (semver / numeric / alphanumeric)
+function compareVersions(v1, v2) {
+  if (!v1 && !v2) return 0;
+  if (!v1) return -1;
+  if (!v2) return 1;
+
+  const clean = v => String(v).trim().replace(/^v/i, '');
+  const p1 = clean(v1).split(/[\.\-_+]/);
+  const p2 = clean(v2).split(/[\.\-_+]/);
+  const maxLen = Math.max(p1.length, p2.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const s1 = p1[i] || '';
+    const s2 = p2[i] || '';
+    const n1 = parseInt(s1, 10);
+    const n2 = parseInt(s2, 10);
+
+    const isNum1 = !isNaN(n1) && /^\d+$/.test(s1);
+    const isNum2 = !isNaN(n2) && /^\d+$/.test(s2);
+
+    if (isNum1 && isNum2) {
+      if (n1 < n2) return -1;
+      if (n1 > n2) return 1;
+      continue;
+    }
+    if (isNum1 && !isNum2) return 1;
+    if (!isNum1 && isNum2) return -1;
+
+    const cmp = s1.toLowerCase().localeCompare(s2.toLowerCase());
+    if (cmp !== 0) return cmp;
+  }
+  return 0;
+}
 
 function showToast(message, isError = false) {
   const toast = document.getElementById("toast");
@@ -25,7 +70,9 @@ function showToast(message, isError = false) {
 
 async function fetchCatalog() {
   try {
-    const res = await fetch("/api/catalog");
+    const res = await fetch("/api/catalog", {
+      headers: authHeaders()
+    });
     const data = await res.json();
     if (data.success && data.catalog && data.catalog.packages) {
       packages = data.catalog.packages;
@@ -39,7 +86,9 @@ async function fetchCatalog() {
 
 async function fetchStatuses() {
   try {
-    const res = await fetch("/api/status");
+    const res = await fetch("/api/status", {
+      headers: authHeaders()
+    });
     const data = await res.json();
     if (data.success && data.tasks) {
       data.tasks.forEach(task => {
@@ -92,9 +141,45 @@ function renderPackages() {
 
   grid.innerHTML = "";
   filtered.forEach(pkg => {
-    const st = statuses[pkg.ID] || "available";
-    const isPending = pendingInstalls.has(pkg.ID);
-    const label = statusLabels[st] || st;
+    const pkgId = pkg.id || pkg.ID;
+    const pkgVer = pkg.version || "1.0";
+    const installedVer = pkg.installed_version || "";
+    const taskStatus = statuses[pkgId] || "";
+    const isPending = pendingInstalls.has(pkgId);
+
+    let badgeText = "";
+    let badgeClass = "";
+    let buttonHtml = "";
+
+    if (isPending || taskStatus === "queued" || taskStatus === "downloading" || taskStatus === "installing") {
+      badgeClass = taskStatus === "queued" ? "queued" : (taskStatus === "downloading" ? "downloading" : "installing");
+      badgeText = statusLabels[taskStatus] || "Przetwarzanie";
+      buttonHtml = `<button class="btn" disabled>${badgeText}...</button>`;
+    } else if (taskStatus === "failed") {
+      badgeClass = "failed";
+      badgeText = "Błąd";
+      buttonHtml = `<button class="btn" onclick="installPackage('${pkgId}', this)">Ponów próbę</button>`;
+    } else if (!installedVer && taskStatus !== "installed") {
+      // 1. Brak zainstalowanej wersji: przycisk „Zainstaluj”
+      badgeClass = "available";
+      badgeText = "Dostępny";
+      buttonHtml = `<button class="btn" onclick="installPackage('${pkgId}', this)">Zainstaluj</button>`;
+    } else {
+      const activeInstalledVer = installedVer || pkgVer;
+      const cmp = compareVersions(activeInstalledVer, pkgVer);
+
+      if (cmp < 0) {
+        // 2. Zainstalowana wersja jest starsza niż w katalogu: przycisk „Zaktualizuj do vX.Y.Z”
+        badgeClass = "upgrade";
+        badgeText = `Aktualizacja (zainst. v${activeInstalledVer})`;
+        buttonHtml = `<button class="btn btn-upgrade" onclick="installPackage('${pkgId}', this)">Zaktualizuj do v${pkgVer}</button>`;
+      } else {
+        // 3. Zainstalowana wersja jest równa lub wyższa: status/badge „Aktualna” i zablokowany przycisk
+        badgeClass = "installed";
+        badgeText = "Aktualna";
+        buttonHtml = `<button class="btn" disabled>Aktualna</button>`;
+      }
+    }
 
     const card = document.createElement("div");
     card.className = "card";
@@ -103,13 +188,10 @@ function renderPackages() {
       ? `<img src="${pkg.icon_url}" alt="${pkg.name}" onerror="this.parentElement.textContent='${(pkg.name || '?')[0]}'"/>`
       : (pkg.name ? pkg.name[0].toUpperCase() : "P");
 
-    let buttonHtml = "";
-    if (st === "installed") {
-      buttonHtml = `<button class="btn" disabled>Zainstalowany</button>`;
-    } else if (st === "installing" || st === "downloading" || st === "queued" || isPending) {
-      buttonHtml = `<button class="btn" disabled>${label}...</button>`;
-    } else {
-      buttonHtml = `<button class="btn" onclick="installPackage('${pkg.ID}', this)">Zainstaluj</button>`;
+    let metaText = pkg.publisher ? `${pkg.publisher} • ` : "";
+    metaText += `v${pkgVer}`;
+    if (installedVer) {
+      metaText += ` (zainst. v${installedVer})`;
     }
 
     card.innerHTML = `
@@ -117,12 +199,12 @@ function renderPackages() {
         <div class="card-icon">${iconHtml}</div>
         <div class="card-title">
           <h3>${pkg.name}</h3>
-          <div class="meta">${pkg.publisher ? pkg.publisher + " • " : ""}v${pkg.version || "1.0"}</div>
+          <div class="meta">${metaText}</div>
         </div>
       </div>
       <div class="card-desc">${pkg.description || "Brak opisu."}</div>
       <div class="card-footer">
-        <span class="badge ${st}">${label}</span>
+        <span class="badge ${badgeClass}">${badgeText}</span>
         ${buttonHtml}
       </div>
     `;
@@ -146,7 +228,7 @@ async function installPackage(packageId, btnElement) {
   try {
     const res = await fetch("/api/install", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ package_id: packageId })
     });
     const data = await res.json();

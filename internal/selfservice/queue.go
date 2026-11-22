@@ -47,6 +47,7 @@ type InstallationQueue struct {
 	reporter       DeployReporter
 	agentID        string
 	consoleBaseURL string
+	installedStore *InstalledStore
 	quitChan       chan struct{}
 	wg             sync.WaitGroup
 	msiTimeout     time.Duration
@@ -59,9 +60,15 @@ func NewInstallationQueue(
 	reporter DeployReporter,
 	agentID string,
 	consoleBaseURL string,
+	store ...*InstalledStore,
 ) *InstallationQueue {
 	if executor == nil {
 		executor = NewWindowsExecutor(30 * time.Minute)
+	}
+
+	var s *InstalledStore
+	if len(store) > 0 {
+		s = store[0]
 	}
 
 	q := &InstallationQueue{
@@ -73,6 +80,7 @@ func NewInstallationQueue(
 		reporter:       reporter,
 		agentID:        agentID,
 		consoleBaseURL: consoleBaseURL,
+		installedStore: s,
 		quitChan:       make(chan struct{}),
 		msiTimeout:     10 * time.Minute,
 	}
@@ -234,6 +242,13 @@ func (q *InstallationQueue) finishTask(task *InstallationTask, status JobStatus,
 	task.FinishedAt = &finished
 	taskCopy := *task
 	q.mu.Unlock()
+
+	// Persist installed package record in installed_packages.json
+	if status == StatusInstalled && q.installedStore != nil {
+		if err := q.installedStore.RecordInstalled(taskCopy.Package); err != nil {
+			log.Printf("[WARN]: failed to record installed package %s: %v", taskCopy.Package.Name, err)
+		}
+	}
 
 	// Report deployment result to OpenUEM via NATS
 	if q.reporter != nil {

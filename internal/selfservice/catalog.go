@@ -14,21 +14,22 @@ import (
 
 // PackageItem represents a single package available in the self-service catalog.
 type PackageItem struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Version     string `json:"version,omitempty"`
-	Publisher   string `json:"publisher,omitempty"`
-	Category    string `json:"category,omitempty"`
-	IconURL     string `json:"icon_url,omitempty"`
-	PackageType string `json:"package_type"` // msi, exe, zip, winget
-	SourceType  string `json:"source_type"`  // upload, https
-	DownloadURL string `json:"download_url,omitempty"`
-	Checksum    string `json:"checksum,omitempty"`
-	SHA256      string `json:"sha256,omitempty"`
-	SilentArgs  string `json:"silent_args,omitempty"`
-	ExecContext string `json:"exec_context"` // system, user
-	Enabled     bool   `json:"enabled"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Description      string `json:"description,omitempty"`
+	Version          string `json:"version,omitempty"`
+	InstalledVersion string `json:"installed_version,omitempty"`
+	Publisher        string `json:"publisher,omitempty"`
+	Category         string `json:"category,omitempty"`
+	IconURL          string `json:"icon_url,omitempty"`
+	PackageType      string `json:"package_type"` // msi, exe, zip, winget
+	SourceType       string `json:"source_type"`  // upload, https
+	DownloadURL      string `json:"download_url,omitempty"`
+	Checksum         string `json:"checksum,omitempty"`
+	SHA256           string `json:"sha256,omitempty"`
+	SilentArgs       string `json:"silent_args,omitempty"`
+	ExecContext      string `json:"exec_context"` // system, user
+	Enabled          bool   `json:"enabled"`
 }
 
 // GetChecksum returns SHA256 or Checksum, whichever is provided.

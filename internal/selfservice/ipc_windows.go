@@ -6,11 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+)
+
+var (
+	modadvapi32IPC                 = windows.NewLazySystemDLL("advapi32.dll")
+	procImpersonateNamedPipeClient = modadvapi32IPC.NewProc("ImpersonateNamedPipeClient")
 )
 
 // IPCServer manages the Windows Named Pipe server instance.
@@ -163,6 +169,13 @@ func (s *IPCServer) listenLoop() {
 func (s *IPCServer) handleConnection(handle windows.Handle) {
 	defer windows.CloseHandle(handle)
 
+	// S-13: Extract client identity directly from the active Named Pipe connection
+	if token, err := extractClientToken(handle); err == nil {
+		SetActiveUserToken(token)
+	} else {
+		log.Printf("[WARN]: failed to extract user token from named pipe client: %v", err)
+	}
+
 	buf := make([]byte, 65536)
 	var bytesRead uint32
 
@@ -177,6 +190,46 @@ func (s *IPCServer) handleConnection(handle windows.Handle) {
 	_ = windows.WriteFile(handle, responseBytes, &bytesWritten, nil)
 	_ = windows.FlushFileBuffers(handle)
 	_ = windows.DisconnectNamedPipe(handle)
+}
+
+// extractClientToken extracts and duplicates the caller's primary access token from the named pipe client (S-13).
+func extractClientToken(handle windows.Handle) (windows.Token, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	r1, _, err := procImpersonateNamedPipeClient.Call(uintptr(handle))
+	if r1 == 0 {
+		return 0, fmt.Errorf("ImpersonateNamedPipeClient failed: %v", err)
+	}
+
+	var threadToken windows.Token
+	err = windows.OpenThreadToken(
+		windows.CurrentThread(),
+		windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY,
+		true,
+		&threadToken,
+	)
+	_ = windows.RevertToSelf()
+
+	if err != nil {
+		return 0, fmt.Errorf("OpenThreadToken failed: %w", err)
+	}
+	defer threadToken.Close()
+
+	var primaryToken windows.Token
+	err = windows.DuplicateTokenEx(
+		threadToken,
+		windows.MAXIMUM_ALLOWED,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenPrimary,
+		&primaryToken,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("DuplicateTokenEx failed: %w", err)
+	}
+
+	return primaryToken, nil
 }
 
 // CallIPC connects to the named pipe, sends an IPCRequest, and decodes the IPCResponse.
