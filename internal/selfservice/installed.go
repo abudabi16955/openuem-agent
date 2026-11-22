@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+var scanRegistryInstalled = ScanRegistryInstalled
+
 // InstalledPackageRecord stores metadata about an installed package.
 type InstalledPackageRecord struct {
 	PackageID   string    `json:"package_id"`
@@ -161,7 +163,7 @@ func DetectInstalledVersion(pkg PackageItem, store *InstalledStore) string {
 	}
 
 	var versionReg string
-	regApps, err := ScanRegistryInstalled()
+	regApps, err := scanRegistryInstalled()
 	if err == nil && len(regApps) > 0 {
 		cleanPkgName := strings.ToLower(strings.TrimSpace(pkg.Name))
 		cleanPkgID := strings.ToLower(strings.TrimSpace(pkg.ID))
@@ -172,12 +174,14 @@ func DetectInstalledVersion(pkg PackageItem, store *InstalledStore) string {
 		} else if v, ok := regApps[cleanPkgName]; ok && v != "" {
 			versionReg = v
 		} else {
-			// 2. Fuzzy substring match on app display name
-			for appName, appVer := range regApps {
-				if cleanPkgName != "" && (strings.Contains(appName, cleanPkgName) || strings.Contains(cleanPkgName, appName)) {
-					if appVer != "" {
-						versionReg = appVer
-						break
+			// 2. Substring match on app display name: registry appName must contain full cleanPkgName, with minimum length >= 4 (S-17)
+			if len(cleanPkgName) >= 4 {
+				for appName, appVer := range regApps {
+					if len(appName) >= 4 && strings.Contains(appName, cleanPkgName) {
+						if appVer != "" {
+							versionReg = appVer
+							break
+						}
 					}
 				}
 			}

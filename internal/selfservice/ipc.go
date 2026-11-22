@@ -48,13 +48,19 @@ func NewIPCDispatcher(catalogMgr *CatalogManager, queue *InstallationQueue, stor
 }
 
 // HandleMessage parses and executes an IPC request, producing an IPCResponse.
-func (d *IPCDispatcher) HandleMessage(msg []byte) []byte {
+func (d *IPCDispatcher) HandleMessage(msg []byte, userTokens ...uintptr) []byte {
+	var userToken uintptr
+	if len(userTokens) > 0 {
+		userToken = userTokens[0]
+	}
+
 	var req IPCRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
+		closeToken(userToken)
 		return d.errorResponse(fmt.Sprintf("invalid IPC request json: %v", err))
 	}
 
-	resp := d.Dispatch(req)
+	resp := d.Dispatch(req, userToken)
 	data, err := json.Marshal(resp)
 	if err != nil {
 		return d.errorResponse(fmt.Sprintf("failed to marshal IPC response: %v", err))
@@ -63,9 +69,15 @@ func (d *IPCDispatcher) HandleMessage(msg []byte) []byte {
 }
 
 // Dispatch executes the request with strict validation.
-func (d *IPCDispatcher) Dispatch(req IPCRequest) IPCResponse {
+func (d *IPCDispatcher) Dispatch(req IPCRequest, userTokens ...uintptr) IPCResponse {
+	var userToken uintptr
+	if len(userTokens) > 0 {
+		userToken = userTokens[0]
+	}
+
 	switch req.Action {
 	case "get_catalog":
+		closeToken(userToken)
 		cat := d.catalogMgr.GetCatalog()
 		for i := range cat.Packages {
 			cat.Packages[i].InstalledVersion = DetectInstalledVersion(cat.Packages[i], d.installedStore)
@@ -80,11 +92,13 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest) IPCResponse {
 		// Installation accepts EXCLUSIVELY ActionID/UUID present in authorized catalog.json.
 		// Arbitrary paths and command injection from unprivileged users are strictly disallowed.
 		if req.PackageID == "" {
+			closeToken(userToken)
 			return IPCResponse{Success: false, Error: "package_id is required"}
 		}
 
 		pkg, found := d.catalogMgr.FindPackage(req.PackageID)
 		if !found {
+			closeToken(userToken)
 			return IPCResponse{
 				Success: false,
 				Error:   fmt.Sprintf("package %s is not found in authorized catalog", req.PackageID),
@@ -92,14 +106,17 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest) IPCResponse {
 		}
 
 		if !pkg.Enabled {
+			closeToken(userToken)
 			return IPCResponse{
 				Success: false,
 				Error:   fmt.Sprintf("package %s is disabled in catalog", pkg.Name),
 			}
 		}
 
-		task, err := d.queue.Enqueue(*pkg)
+		// S-16: Enqueue passes the userToken directly to the created task
+		task, err := d.queue.Enqueue(*pkg, userToken)
 		if err != nil {
+			closeToken(userToken)
 			return IPCResponse{
 				Success: false,
 				Error:   err.Error(),
@@ -112,6 +129,7 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest) IPCResponse {
 		}
 
 	case "get_status":
+		closeToken(userToken)
 		if req.TaskID != "" {
 			task, found := d.queue.GetTask(req.TaskID)
 			if !found {
@@ -129,6 +147,7 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest) IPCResponse {
 		return IPCResponse{Success: true, Tasks: tasks}
 
 	default:
+		closeToken(userToken)
 		log.Printf("[WARN]: unknown IPC action requested: %s", req.Action)
 		return IPCResponse{
 			Success: false,

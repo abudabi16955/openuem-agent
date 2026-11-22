@@ -11,7 +11,7 @@ import (
 
 // Executor defines the interface for running package installations.
 type Executor interface {
-	Execute(pkg PackageItem, localPath string) (string, error)
+	Execute(pkg PackageItem, localPath string, userToken ...uintptr) (string, error)
 }
 
 // BuildMSIArgs constructs command line arguments for msiexec.

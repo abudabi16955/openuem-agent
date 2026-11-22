@@ -42,19 +42,21 @@ func TestIPCDispatcher_SecurityValidation(t *testing.T) {
 	require.NotNil(t, resp.Catalog)
 	assert.Len(t, resp.Catalog.Packages, 2)
 
-	// 2. Test install of authorized enabled package -> SUCCESS
+	// 2. Test install of authorized enabled package -> SUCCESS (with token)
+	testToken := uintptr(98765)
 	resp = dispatcher.Dispatch(IPCRequest{
 		Action:    "install",
 		PackageID: "valid-uuid-1",
-	})
+	}, testToken)
 	assert.True(t, resp.Success, "authorized package should succeed")
 	assert.NotEmpty(t, resp.Task.ID)
+	assert.Equal(t, testToken, resp.Task.UserToken)
 
 	// 3. Test install of arbitrary/unauthorized UUID or path -> REJECTED
 	resp = dispatcher.Dispatch(IPCRequest{
 		Action:    "install",
 		PackageID: "arbitrary-uuid-or-path; calc.exe",
-	})
+	}, uintptr(11111))
 	assert.False(t, resp.Success, "arbitrary package ID must be rejected")
 	assert.Contains(t, resp.Error, "not found in authorized catalog")
 
@@ -62,7 +64,7 @@ func TestIPCDispatcher_SecurityValidation(t *testing.T) {
 	resp = dispatcher.Dispatch(IPCRequest{
 		Action:    "install",
 		PackageID: "disabled-uuid-2",
-	})
+	}, uintptr(22222))
 	assert.False(t, resp.Success, "disabled package must be rejected")
 	assert.Contains(t, resp.Error, "disabled")
 
@@ -70,7 +72,7 @@ func TestIPCDispatcher_SecurityValidation(t *testing.T) {
 	resp = dispatcher.Dispatch(IPCRequest{
 		Action:    "get_status",
 		PackageID: "valid-uuid-1",
-	})
+	}, uintptr(33333))
 	assert.True(t, resp.Success)
 	assert.NotEmpty(t, resp.Status)
 }

@@ -21,7 +21,7 @@ func NewWindowsExecutor(timeout time.Duration) *WindowsExecutor {
 }
 
 // Execute handles mock execution for tests and non-Windows builds.
-func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, error) {
+func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens ...uintptr) (string, error) {
 	pkgType := strings.ToLower(strings.TrimSpace(pkg.PackageType))
 
 	switch pkgType {

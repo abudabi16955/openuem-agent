@@ -169,27 +169,23 @@ func (s *IPCServer) listenLoop() {
 func (s *IPCServer) handleConnection(handle windows.Handle) {
 	defer windows.CloseHandle(handle)
 
-	buf := make([]byte, 65536)
-	var bytesRead uint32
-
-	err := windows.ReadFile(handle, buf, &bytesRead, nil)
-	if err != nil || bytesRead == 0 {
-		return
-	}
-
 	// S-13: Extract client identity directly from the active Named Pipe connection
-	// ImpersonateNamedPipeClient requires data to be read from the pipe first (ERROR_CANNOT_IMPERSONATE / 1368).
-	if token, err := extractClientToken(handle); err == nil {
-		if isNonSystemUserToken(token) {
-			SetActiveUserToken(token)
-		} else {
-			token.Close()
-		}
-	} else {
+	token, err := extractClientToken(handle)
+	if err != nil {
 		log.Printf("[WARN]: failed to extract user token from named pipe client: %v", err)
 	}
 
-	responseBytes := s.dispatcher.HandleMessage(buf[:bytesRead])
+	buf := make([]byte, 65536)
+	var bytesRead uint32
+
+	err = windows.ReadFile(handle, buf, &bytesRead, nil)
+	if err != nil || bytesRead == 0 {
+		closeToken(uintptr(token))
+		return
+	}
+
+	// S-16: Dispatch message passing client token directly (no global activeUserToken)
+	responseBytes := s.dispatcher.HandleMessage(buf[:bytesRead], uintptr(token))
 
 	var bytesWritten uint32
 	_ = windows.WriteFile(handle, responseBytes, &bytesWritten, nil)
@@ -304,17 +300,4 @@ func CallIPC(pipeName string, req IPCRequest) (*IPCResponse, error) {
 	}
 
 	return &resp, nil
-}
-
-func isNonSystemUserToken(token windows.Token) bool {
-	u, err := token.GetTokenUser()
-	if err != nil || u.User.Sid == nil {
-		return false
-	}
-	sid := u.User.Sid.String()
-	// S-1-5-18: LocalSystem, S-1-5-19: LocalService, S-1-5-20: NetworkService
-	if sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20" {
-		return false
-	}
-	return true
 }

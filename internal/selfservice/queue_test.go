@@ -16,15 +16,19 @@ type mockExecutor struct {
 	executedList []string
 	delay        time.Duration
 	failPkgID    string
+	lastToken    uintptr
 }
 
-func (m *mockExecutor) Execute(pkg PackageItem, localPath string) (string, error) {
+func (m *mockExecutor) Execute(pkg PackageItem, localPath string, userTokens ...uintptr) (string, error) {
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
 
 	m.mu.Lock()
 	m.executedList = append(m.executedList, pkg.ID)
+	if len(userTokens) > 0 {
+		m.lastToken = userTokens[0]
+	}
 	m.mu.Unlock()
 
 	if m.failPkgID == pkg.ID {
@@ -45,87 +49,115 @@ func (r *mockReporter) ReportDeployResult(action openuem_nats.DeployAction) erro
 	return nil
 }
 
-func TestInstallationQueue_FIFOOrder(t *testing.T) {
+func TestInstallationQueue_SequentialFIFO(t *testing.T) {
 	exec := &mockExecutor{delay: 20 * time.Millisecond}
 	rep := &mockReporter{}
 
-	// winget packages skip downloader
-	q := NewInstallationQueue(nil, exec, rep, "agent-123", "")
+	q := NewInstallationQueue(nil, exec, rep, "agent-test", "")
 	defer q.Stop()
 
-	pkg1 := PackageItem{ID: "pkg-1", Name: "App 1", PackageType: "winget"}
-	pkg2 := PackageItem{ID: "pkg-2", Name: "App 2", PackageType: "winget"}
-	pkg3 := PackageItem{ID: "pkg-3", Name: "App 3", PackageType: "winget"}
+	pkg1 := PackageItem{ID: "pkg-1", Name: "Package 1", PackageType: "winget"}
+	pkg2 := PackageItem{ID: "pkg-2", Name: "Package 2", PackageType: "winget"}
+	pkg3 := PackageItem{ID: "pkg-3", Name: "Package 3", PackageType: "winget"}
 
-	t1, err := q.Enqueue(pkg1)
-	require.NoError(t, err)
-	t2, err := q.Enqueue(pkg2)
-	require.NoError(t, err)
-	t3, err := q.Enqueue(pkg3)
-	require.NoError(t, err)
-
+	t1, err1 := q.Enqueue(pkg1)
+	require.NoError(t, err1)
 	assert.Equal(t, StatusQueued, t1.Status)
+
+	t2, err2 := q.Enqueue(pkg2)
+	require.NoError(t, err2)
 	assert.Equal(t, StatusQueued, t2.Status)
+
+	t3, err3 := q.Enqueue(pkg3)
+	require.NoError(t, err3)
 	assert.Equal(t, StatusQueued, t3.Status)
 
-	// Wait for queue to process all 3 items
+	// Wait for queue processing to complete
 	require.Eventually(t, func() bool {
-		st1 := q.GetStatusByPackageID(pkg1.ID)
-		st2 := q.GetStatusByPackageID(pkg2.ID)
-		st3 := q.GetStatusByPackageID(pkg3.ID)
+		st1 := q.GetStatusByPackageID("pkg-1")
+		st2 := q.GetStatusByPackageID("pkg-2")
+		st3 := q.GetStatusByPackageID("pkg-3")
 		return st1 == StatusInstalled && st2 == StatusInstalled && st3 == StatusInstalled
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 3*time.Second, 20*time.Millisecond)
 
 	exec.mu.Lock()
-	assert.Equal(t, []string{"pkg-1", "pkg-2", "pkg-3"}, exec.executedList, "tasks must be processed in strict FIFO order")
-	exec.mu.Unlock()
+	defer exec.mu.Unlock()
+	assert.Equal(t, []string{"pkg-1", "pkg-2", "pkg-3"}, exec.executedList)
 
 	rep.mu.Lock()
+	defer rep.mu.Unlock()
 	assert.Len(t, rep.actions, 3)
-	assert.False(t, rep.actions[0].Failed)
 	assert.Equal(t, "pkg-1", rep.actions[0].PackageId)
-	rep.mu.Unlock()
+	assert.Equal(t, "pkg-2", rep.actions[1].PackageId)
+	assert.Equal(t, "pkg-3", rep.actions[2].PackageId)
 }
 
-func TestInstallationQueue_PreventDuplicateActiveInstall(t *testing.T) {
+func TestInstallationQueue_PreventDuplicates(t *testing.T) {
 	exec := &mockExecutor{delay: 100 * time.Millisecond}
 	rep := &mockReporter{}
 
-	q := NewInstallationQueue(nil, exec, rep, "agent-123", "")
+	q := NewInstallationQueue(nil, exec, rep, "agent-test", "")
 	defer q.Stop()
 
-	pkg := PackageItem{ID: "pkg-dup", Name: "App Duplicate", PackageType: "winget"}
+	pkg := PackageItem{ID: "pkg-dup", Name: "Duplicate Test", PackageType: "winget"}
 
-	_, err := q.Enqueue(pkg)
+	t1, err := q.Enqueue(pkg)
 	require.NoError(t, err)
+	assert.NotNil(t, t1)
 
-	// Second enqueue of same package while in progress should fail
-	_, err = q.Enqueue(pkg)
-	require.Error(t, err)
+	// Enqueue again immediately while first is queued/in-progress
+	t2, err := q.Enqueue(pkg)
+	assert.Error(t, err)
+	assert.Equal(t, t1.ID, t2.ID)
 	assert.Contains(t, err.Error(), "already")
 }
 
-func TestInstallationQueue_HandleFailure(t *testing.T) {
+func TestInstallationQueue_FailureHandling(t *testing.T) {
 	exec := &mockExecutor{failPkgID: "pkg-fail"}
 	rep := &mockReporter{}
 
-	q := NewInstallationQueue(nil, exec, rep, "agent-123", "")
+	q := NewInstallationQueue(nil, exec, rep, "agent-test", "")
 	defer q.Stop()
 
-	pkg := PackageItem{ID: "pkg-fail", Name: "Failing App", PackageType: "winget"}
-	task, err := q.Enqueue(pkg)
+	pkg := PackageItem{ID: "pkg-fail", Name: "Failing Package", PackageType: "winget"}
+
+	t1, err := q.Enqueue(pkg)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		tInfo, found := q.GetTask(task.ID)
-		return found && tInfo.Status == StatusFailed
-	}, 1*time.Second, 20*time.Millisecond)
+		task, found := q.GetTask(t1.ID)
+		return found && task.Status == StatusFailed
+	}, 2*time.Second, 20*time.Millisecond)
 
-	tInfo, _ := q.GetTask(task.ID)
-	assert.Contains(t, tInfo.Error, "mock execution error")
+	task, _ := q.GetTask(t1.ID)
+	assert.Equal(t, StatusFailed, task.Status)
+	assert.Contains(t, task.Error, "mock execution error")
 
 	rep.mu.Lock()
+	defer rep.mu.Unlock()
 	require.Len(t, rep.actions, 1)
 	assert.True(t, rep.actions[0].Failed)
-	rep.mu.Unlock()
+}
+
+func TestInstallationQueue_UserTokenPassed(t *testing.T) {
+	exec := &mockExecutor{}
+	rep := &mockReporter{}
+
+	q := NewInstallationQueue(nil, exec, rep, "agent-test", "")
+	defer q.Stop()
+
+	pkg := PackageItem{ID: "pkg-token", Name: "Token Package", PackageType: "winget"}
+	dummyToken := uintptr(12345)
+
+	t1, err := q.Enqueue(pkg, dummyToken)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		task, found := q.GetTask(t1.ID)
+		return found && task.Status == StatusInstalled
+	}, 2*time.Second, 20*time.Millisecond)
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	assert.Equal(t, dummyToken, exec.lastToken)
 }

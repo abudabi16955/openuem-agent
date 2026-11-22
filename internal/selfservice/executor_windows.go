@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -26,44 +25,7 @@ var (
 	moduserenv                  = windows.NewLazySystemDLL("userenv.dll")
 	procCreateEnvironmentBlock  = moduserenv.NewProc("CreateEnvironmentBlock")
 	procDestroyEnvironmentBlock = moduserenv.NewProc("DestroyEnvironmentBlock")
-
-	activeTokenMu   sync.RWMutex
-	activeUserToken windows.Token
 )
-
-// SetActiveUserToken stores a duplicate of the primary user token obtained directly from the IPC connection (S-13).
-func SetActiveUserToken(token windows.Token) {
-	activeTokenMu.Lock()
-	defer activeTokenMu.Unlock()
-	if activeUserToken != 0 {
-		_ = activeUserToken.Close()
-	}
-	activeUserToken = token
-}
-
-// GetActiveUserToken returns a duplicated handle to the active user token obtained via Named Pipe IPC (S-13).
-func GetActiveUserToken() (windows.Token, error) {
-	activeTokenMu.RLock()
-	defer activeTokenMu.RUnlock()
-
-	if activeUserToken == 0 {
-		return 0, fmt.Errorf("no active user token available from IPC client (runAsUser requires an active Named Pipe session)")
-	}
-
-	var dup windows.Token
-	err := windows.DuplicateTokenEx(
-		activeUserToken,
-		windows.MAXIMUM_ALLOWED,
-		nil,
-		windows.SecurityImpersonation,
-		windows.TokenPrimary,
-		&dup,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("failed to duplicate active user token: %w", err)
-	}
-	return dup, nil
-}
 
 // WindowsExecutor implements package installation execution on Windows.
 type WindowsExecutor struct {
@@ -79,14 +41,12 @@ func NewWindowsExecutor(timeout time.Duration) *WindowsExecutor {
 }
 
 // prepareUserPermissions grants Read & Execute permissions to the user's SID (S-14).
-func (e *WindowsExecutor) prepareUserPermissions(path string) {
-	token, err := GetActiveUserToken()
-	if err != nil {
+func (e *WindowsExecutor) prepareUserPermissions(path string, userToken windows.Token) {
+	if userToken == 0 {
 		return
 	}
-	defer token.Close()
 
-	user, err := token.GetTokenUser()
+	user, err := userToken.GetTokenUser()
 	if err != nil || user.User.Sid == nil {
 		return
 	}
@@ -98,27 +58,36 @@ func (e *WindowsExecutor) prepareUserPermissions(path string) {
 }
 
 // Execute executes a package installation based on its PackageType and ExecContext.
-func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, error) {
+func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens ...uintptr) (string, error) {
+	var userToken windows.Token
+	if len(userTokens) > 0 {
+		userToken = windows.Token(userTokens[0])
+	}
+
 	pkgType := strings.ToLower(strings.TrimSpace(pkg.PackageType))
 	execContext := strings.ToLower(strings.TrimSpace(pkg.ExecContext))
 	if execContext == "" {
 		execContext = "system"
 	}
 
+	if execContext == "user" && userToken == 0 {
+		return "", fmt.Errorf("user execution context requires a valid user token")
+	}
+
 	switch pkgType {
 	case "msi":
 		if execContext == "user" && localPath != "" {
-			e.prepareUserPermissions(localPath)
+			e.prepareUserPermissions(localPath, userToken)
 		}
 		args := BuildMSIArgs(localPath, pkg.SilentArgs)
-		return e.runCommand("msiexec.exe", args, execContext)
+		return e.runCommand("msiexec.exe", args, execContext, userToken)
 
 	case "exe":
 		if execContext == "user" && localPath != "" {
-			e.prepareUserPermissions(localPath)
+			e.prepareUserPermissions(localPath, userToken)
 		}
 		args := BuildCustomArgs(pkg.SilentArgs)
-		return e.runCommand(localPath, args, execContext)
+		return e.runCommand(localPath, args, execContext, userToken)
 
 	case "zip":
 		scratchDir := filepath.Join(GetSelfServiceDir(), "scratch", pkg.ID)
@@ -139,17 +108,17 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, er
 		}
 
 		if execContext == "user" {
-			e.prepareUserPermissions(scratchDir)
-			e.prepareUserPermissions(exePath)
+			e.prepareUserPermissions(scratchDir, userToken)
+			e.prepareUserPermissions(exePath, userToken)
 		}
 
 		if strings.EqualFold(filepath.Ext(exePath), ".msi") {
 			args := BuildMSIArgs(exePath, pkg.SilentArgs)
-			return e.runCommand("msiexec.exe", args, execContext)
+			return e.runCommand("msiexec.exe", args, execContext, userToken)
 		}
 
 		args := BuildCustomArgs(pkg.SilentArgs)
-		return e.runCommand(exePath, args, execContext)
+		return e.runCommand(exePath, args, execContext, userToken)
 
 	case "winget":
 		targetID := pkg.ID
@@ -158,16 +127,16 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string) (string, er
 			targetID = pkg.DownloadURL
 		}
 		args := BuildWingetArgs(targetID, pkg.SilentArgs)
-		return e.runCommand("winget.exe", args, execContext)
+		return e.runCommand("winget.exe", args, execContext, userToken)
 
 	default:
 		return "", fmt.Errorf("unsupported package type: %s", pkg.PackageType)
 	}
 }
 
-func (e *WindowsExecutor) runCommand(cmdPath string, args []string, execContext string) (string, error) {
+func (e *WindowsExecutor) runCommand(cmdPath string, args []string, execContext string, userToken windows.Token) (string, error) {
 	if execContext == "user" {
-		return e.runAsUser(cmdPath, args)
+		return e.runAsUser(cmdPath, args, userToken)
 	}
 	return e.runAsSystem(cmdPath, args)
 }
@@ -234,22 +203,20 @@ func parseEnvBlock(block *uint16) []string {
 	return env
 }
 
-func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, error) {
-	// 1. Acquire user token directly from IPC Named Pipe client connection (S-13)
-	primaryToken, err := GetActiveUserToken()
-	if err != nil {
-		return "", fmt.Errorf("failed to acquire user token: %w", err)
+func (e *WindowsExecutor) runAsUser(cmdPath string, args []string, userToken windows.Token) (string, error) {
+	// 1. Verify user token passed per-task (S-16)
+	if userToken == 0 {
+		return "", fmt.Errorf("failed to acquire user token: no valid user token provided")
 	}
-	defer primaryToken.Close()
 
 	// Grant Read & Execute permissions if cmdPath is a local file (S-14)
 	if fi, err := os.Stat(cmdPath); err == nil && !fi.IsDir() {
-		e.prepareUserPermissions(cmdPath)
+		e.prepareUserPermissions(cmdPath, userToken)
 	}
 
 	// 2. Create environment block for user token
 	var envBlock *uint16
-	r1, _, errEnv := procCreateEnvironmentBlock.Call(uintptr(unsafe.Pointer(&envBlock)), uintptr(primaryToken), 0)
+	r1, _, errEnv := procCreateEnvironmentBlock.Call(uintptr(unsafe.Pointer(&envBlock)), uintptr(userToken), 0)
 	if r1 != 0 && envBlock != nil {
 		defer procDestroyEnvironmentBlock.Call(uintptr(unsafe.Pointer(envBlock)))
 	} else {
@@ -304,7 +271,7 @@ func (e *WindowsExecutor) runAsUser(cmdPath string, args []string) (string, erro
 	const LOGON_WITH_PROFILE = 1
 
 	ret, _, procErr := procCreateProcessWithTokenW.Call(
-		uintptr(primaryToken),
+		uintptr(userToken),
 		uintptr(LOGON_WITH_PROFILE),
 		0,
 		uintptr(unsafe.Pointer(cmdLine16)),

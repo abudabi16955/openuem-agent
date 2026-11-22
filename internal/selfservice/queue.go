@@ -34,6 +34,7 @@ type InstallationTask struct {
 	CreatedAt  time.Time   `json:"created_at"`
 	StartedAt  *time.Time  `json:"started_at,omitempty"`
 	FinishedAt *time.Time  `json:"finished_at,omitempty"`
+	UserToken  uintptr     `json:"-"`
 }
 
 // InstallationQueue coordinates sequential FIFO processing of package installations.
@@ -92,7 +93,12 @@ func NewInstallationQueue(
 }
 
 // Enqueue adds a package installation request to the FIFO queue.
-func (q *InstallationQueue) Enqueue(pkg PackageItem) (*InstallationTask, error) {
+func (q *InstallationQueue) Enqueue(pkg PackageItem, userTokens ...uintptr) (*InstallationTask, error) {
+	var userToken uintptr
+	if len(userTokens) > 0 {
+		userToken = userTokens[0]
+	}
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -101,6 +107,7 @@ func (q *InstallationQueue) Enqueue(pkg PackageItem) (*InstallationTask, error) 
 		if existing.Status == StatusQueued ||
 			existing.Status == StatusDownloading ||
 			existing.Status == StatusInstalling {
+			closeToken(userToken)
 			return existing, fmt.Errorf("package %s is already %s", pkg.Name, existing.Status)
 		}
 	}
@@ -111,6 +118,7 @@ func (q *InstallationQueue) Enqueue(pkg PackageItem) (*InstallationTask, error) 
 		Package:   pkg,
 		Status:    StatusQueued,
 		CreatedAt: time.Now(),
+		UserToken: userToken,
 	}
 
 	q.tasks[task.ID] = task
@@ -123,6 +131,7 @@ func (q *InstallationQueue) Enqueue(pkg PackageItem) (*InstallationTask, error) 
 	default:
 		task.Status = StatusFailed
 		task.Error = "installation queue is full"
+		closeToken(userToken)
 		return nil, fmt.Errorf("installation queue is full")
 	}
 }
@@ -165,6 +174,19 @@ func (q *InstallationQueue) GetAllTasks() []InstallationTask {
 func (q *InstallationQueue) Stop() {
 	close(q.quitChan)
 	q.wg.Wait()
+
+	// Drain any remaining unexecuted tasks and close user tokens (S-16)
+	for {
+		select {
+		case task := <-q.queueChan:
+			if task != nil && task.UserToken != 0 {
+				closeToken(task.UserToken)
+				task.UserToken = 0
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (q *InstallationQueue) workerLoop() {
@@ -184,6 +206,13 @@ func (q *InstallationQueue) workerLoop() {
 }
 
 func (q *InstallationQueue) processTask(task *InstallationTask) {
+	defer func() {
+		if task.UserToken != 0 {
+			closeToken(task.UserToken)
+			task.UserToken = 0
+		}
+	}()
+
 	now := time.Now()
 	q.mu.Lock()
 	task.StartedAt = &now
@@ -222,7 +251,7 @@ func (q *InstallationQueue) processTask(task *InstallationTask) {
 	q.mu.Unlock()
 
 	log.Printf("[INFO]: executing installation for package %s (%s)", task.Package.Name, task.Package.PackageType)
-	output, err := q.executor.Execute(task.Package, localFilePath)
+	output, err := q.executor.Execute(task.Package, localFilePath, task.UserToken)
 	if err != nil {
 		log.Printf("[ERROR]: installation failed for package %s: %v", task.Package.Name, err)
 		q.finishTask(task, StatusFailed, output, err.Error())
