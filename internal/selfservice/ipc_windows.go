@@ -169,19 +169,19 @@ func (s *IPCServer) listenLoop() {
 func (s *IPCServer) handleConnection(handle windows.Handle) {
 	defer windows.CloseHandle(handle)
 
-	// S-13: Extract client identity directly from the active Named Pipe connection
-	token, err := extractClientToken(handle)
-	if err != nil {
-		log.Printf("[WARN]: failed to extract user token from named pipe client: %v", err)
-	}
-
 	buf := make([]byte, 65536)
 	var bytesRead uint32
 
-	err = windows.ReadFile(handle, buf, &bytesRead, nil)
+	err := windows.ReadFile(handle, buf, &bytesRead, nil)
 	if err != nil || bytesRead == 0 {
-		closeToken(uintptr(token))
 		return
+	}
+
+	// S-13: Extract client identity directly from the active Named Pipe connection
+	// ImpersonateNamedPipeClient requires data to be read from the pipe first (ERROR_CANNOT_IMPERSONATE / 1368).
+	token, err := extractClientToken(handle)
+	if err != nil {
+		log.Printf("[WARN]: failed to extract user token from named pipe client: %v", err)
 	}
 
 	// S-16: Dispatch message passing client token directly (no global activeUserToken)
