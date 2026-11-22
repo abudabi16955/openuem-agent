@@ -113,10 +113,10 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest, userTokens ...uintptr) IPCRespo
 			}
 		}
 
-		// S-16: Enqueue passes the userToken directly to the created task
+		// S-16: Enqueue passes the userToken directly to the created task.
+		// Ownership of userToken is transferred to Enqueue, which closes it on failure or task completion.
 		task, err := d.queue.Enqueue(*pkg, userToken)
 		if err != nil {
-			closeToken(userToken)
 			return IPCResponse{
 				Success: false,
 				Error:   err.Error(),
