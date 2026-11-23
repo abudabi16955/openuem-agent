@@ -71,15 +71,15 @@ func safeArrayToStringSlice(sa *ole.SafeArray) (result []string, err error) {
 				_ = v.Clear()
 			}
 		} else {
-			var bstrPtr uintptr
+			var bstrPtr *uint16
 			r1, _, _ := procSafeArrayGetElement.Call(
 				uintptr(unsafe.Pointer(sa)),
 				uintptr(unsafe.Pointer(&idx)),
 				uintptr(unsafe.Pointer(&bstrPtr)),
 			)
-			if r1 == 0 && bstrPtr != 0 {
-				result = append(result, windows.UTF16PtrToString((*uint16)(unsafe.Pointer(bstrPtr))))
-				procSysFreeString.Call(bstrPtr)
+			if r1 == 0 && bstrPtr != nil {
+				result = append(result, windows.UTF16PtrToString(bstrPtr))
+				procSysFreeString.Call(uintptr(unsafe.Pointer(bstrPtr)))
 			}
 		}
 	}
