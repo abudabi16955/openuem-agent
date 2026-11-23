@@ -25,6 +25,7 @@ import (
 	remotedesktop "github.com/open-uem/openuem-agent/internal/commands/remote-desktop"
 	"github.com/open-uem/openuem-agent/internal/commands/report"
 	"github.com/open-uem/openuem-agent/internal/commands/sftp"
+	"github.com/open-uem/openuem-agent/internal/selfservice"
 	openuem_utils "github.com/open-uem/utils"
 	"gopkg.in/ini.v1"
 )
@@ -44,6 +45,7 @@ type Agent struct {
 	SFTPServer             *sftp.SFTP
 	JetstreamContextCancel context.CancelFunc
 	WingetConfigureJob     gocron.Job
+	SelfService            *selfservice.Service
 }
 
 type JSONActions struct {
@@ -88,6 +90,10 @@ func New() Agent {
 }
 
 func (a *Agent) Stop() {
+	if a.SelfService != nil {
+		a.SelfService.Stop()
+	}
+
 	if a.TaskScheduler != nil {
 		if err := a.TaskScheduler.Shutdown(); err != nil {
 			log.Printf("[ERROR]: could not close NATS connection, reason: %s\n", err.Error())

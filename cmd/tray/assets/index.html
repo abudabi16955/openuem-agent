@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="openuem-token" content="{{TRAY_AUTH_TOKEN}}">
+  <title>OpenUEM - Portal Self-Service</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <h1>OpenUEM Self-Service Portal</h1>
+      <span>Katalog Oprogramowania</span>
+    </div>
+  </header>
+
+  <section class="filters-bar">
+    <div class="search-box">
+      <input type="text" id="searchInput" placeholder="Szukaj aplikacji (nazwa, wydawca, opis)...">
+    </div>
+    <select id="categorySelect" class="category-select">
+      <option value="all">Wszystkie kategorie</option>
+    </select>
+  </section>
+
+  <main id="packageGrid" class="grid">
+    <div class="empty-state">Ładowanie katalogu aplikacji...</div>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
