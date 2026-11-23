@@ -38,6 +38,7 @@ var (
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procLoadImageW          = user32.NewProc("LoadImageW")
 	procLoadIconW           = user32.NewProc("LoadIconW")
+	procMessageBoxW         = user32.NewProc("MessageBoxW")
 	procShellNotifyIconW    = shell32.NewProc("Shell_NotifyIconW")
 )
 
@@ -46,6 +47,9 @@ const (
 	SW_NORMAL  = 1
 	SW_SHOW    = 5
 	SW_RESTORE = 9
+
+	MB_OK        = 0x00000000
+	MB_ICONERROR = 0x00000010
 
 	WM_DESTROY         = 0x0002
 	WM_CLOSE           = 0x0010
@@ -316,12 +320,24 @@ func main() {
 		},
 	})
 	if wv == nil {
-		log.Fatalf("[FATAL]: failed to create WebView2 window (is WebView2 Runtime installed?)")
+		msgPtr, _ := windows.UTF16PtrFromString("Microsoft Edge WebView2 Runtime is required to run the OpenUEM Self-Service Portal. Please install WebView2 Runtime and try again.")
+		titlePtr, _ := windows.UTF16PtrFromString(windowTitle)
+		procMessageBoxW.Call(
+			0,
+			uintptr(unsafe.Pointer(msgPtr)),
+			uintptr(unsafe.Pointer(titlePtr)),
+			uintptr(MB_OK|MB_ICONERROR),
+		)
+		log.Fatalf("[FATAL]: Microsoft Edge WebView2 Runtime is required to run the OpenUEM Self-Service Portal. Please install WebView2 Runtime and try again.")
 	}
 
 	hwnd := uintptr(wv.Window())
 	globalHWnd = hwnd
 	globalWV = wv
+
+	if !*openBrowser {
+		procShowWindow.Call(hwnd, SW_HIDE)
+	}
 
 	// 4. Set window and tray icon
 	hIcon := getOrExtractIcon()

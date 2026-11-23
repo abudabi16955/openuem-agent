@@ -2318,6 +2318,10 @@ func (a *Agent) StartSelfService() {
 	}
 }
 
+func formatTrayAutostartCommand(targetExe string) string {
+	return fmt.Sprintf("\"%s\" -open=false", targetExe)
+}
+
 func (a *Agent) setupTrayAutostart() {
 	programFiles := os.Getenv("ProgramFiles")
 	if programFiles == "" {
@@ -2371,7 +2375,8 @@ func (a *Agent) setupTrayAutostart() {
 		log.Printf("[WARN]: could not open Run registry key: %v", err)
 	} else {
 		defer k.Close()
-		if err := k.SetStringValue("OpenUEM Tray", targetExe); err != nil {
+		runValue := formatTrayAutostartCommand(targetExe)
+		if err := k.SetStringValue("OpenUEM Tray", runValue); err != nil {
 			log.Printf("[WARN]: could not set OpenUEM Tray run key: %v", err)
 		} else {
 			log.Printf("[INFO]: registered OpenUEM Tray autostart in HKLM Run key")
