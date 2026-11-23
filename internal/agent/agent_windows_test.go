@@ -130,3 +130,20 @@ func TestPreparePowerShellScriptWindows(t *testing.T) {
 		t.Fatalf("expected Polish characters to be preserved")
 	}
 }
+
+func TestFormatTrayAutostartCommand(t *testing.T) {
+	targetExe := `C:\Program Files\OpenUEM\openuem-tray.exe`
+	expected := `"C:\Program Files\OpenUEM\openuem-tray.exe" -open=false`
+	got := formatTrayAutostartCommand(targetExe)
+	if got != expected {
+		t.Fatalf("expected %q, got %q", expected, got)
+	}
+
+	// Verify CWE-428 mitigation: quoted path
+	if !strings.HasPrefix(got, `"`) {
+		t.Errorf("expected command to start with a quote for CWE-428 protection, got %q", got)
+	}
+	if !strings.Contains(got, `" -open=false`) {
+		t.Errorf("expected command to contain closing quote before -open=false, got %q", got)
+	}
+}

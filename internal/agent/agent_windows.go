@@ -34,6 +34,7 @@ import (
 	openuem_utils "github.com/open-uem/utils"
 	"github.com/open-uem/wingetcfg/wingetcfg"
 	"gopkg.in/yaml.v3"
+	"golang.org/x/sys/windows/registry"
 )
 
 func (a *Agent) Start() {
@@ -2290,6 +2291,8 @@ func (a *Agent) PerformBitLockerEscrow(force bool) (int, error) {
 }
 
 func (a *Agent) StartSelfService() {
+	a.setupTrayAutostart()
+
 	selfServiceCfg := selfservice.ServiceConfig{
 		AgentCert:     a.Config.AgentCert,
 		AgentKey:      a.Config.AgentKey,
@@ -2313,4 +2316,105 @@ func (a *Agent) StartSelfService() {
 	if err := a.SelfService.Start(); err != nil {
 		log.Printf("[ERROR]: could not start selfservice service: %v", err)
 	}
+}
+
+func formatTrayAutostartCommand(targetExe string) string {
+	return fmt.Sprintf("\"%s\" -open=false", targetExe)
+}
+
+func (a *Agent) setupTrayAutostart() {
+	programFiles := os.Getenv("ProgramFiles")
+	if programFiles == "" {
+		programFiles = `C:\Program Files`
+	}
+	targetDir := filepath.Join(programFiles, "OpenUEM")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		log.Printf("[WARN]: could not create %s: %v", targetDir, err)
+	}
+
+	targetExe := filepath.Join(targetDir, "openuem-tray.exe")
+
+	// Find openuem-tray.exe in agent directory or next to it
+	var srcExe string
+	cwd, _ := openuem_utils.GetWd()
+	execPath, _ := os.Executable()
+	candidatePaths := []string{
+		filepath.Join(cwd, "openuem-tray.exe"),
+		filepath.Join(cwd, "bin", "openuem-tray.exe"),
+		filepath.Join(cwd, "cmd", "tray", "openuem-tray.exe"),
+	}
+	if execPath != "" {
+		execDir := filepath.Dir(execPath)
+		candidatePaths = append(candidatePaths,
+			filepath.Join(execDir, "openuem-tray.exe"),
+			filepath.Join(execDir, "bin", "openuem-tray.exe"),
+			filepath.Join(execDir, "cmd", "tray", "openuem-tray.exe"),
+		)
+	}
+
+	for _, cand := range candidatePaths {
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			if !strings.EqualFold(filepath.Clean(cand), filepath.Clean(targetExe)) {
+				srcExe = cand
+				break
+			}
+		}
+	}
+
+	if srcExe != "" {
+		if err := copyTrayBinary(srcExe, targetExe); err != nil {
+			log.Printf("[WARN]: could not copy tray binary from %s to %s: %v", srcExe, targetExe, err)
+		} else {
+			log.Printf("[INFO]: copied tray binary from %s to %s", srcExe, targetExe)
+		}
+	}
+
+	// Create registry entry in HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	if err != nil {
+		log.Printf("[WARN]: could not open Run registry key: %v", err)
+	} else {
+		defer k.Close()
+		runValue := formatTrayAutostartCommand(targetExe)
+		if err := k.SetStringValue("OpenUEM Tray", runValue); err != nil {
+			log.Printf("[WARN]: could not set OpenUEM Tray run key: %v", err)
+		} else {
+			log.Printf("[INFO]: registered OpenUEM Tray autostart in HKLM Run key")
+		}
+	}
+
+	// Create Start Menu shortcut
+	programData := os.Getenv("ProgramData")
+	if programData == "" {
+		programData = `C:\ProgramData`
+	}
+	shortcutDir := filepath.Join(programData, `Microsoft\Windows\Start Menu\Programs`)
+	_ = os.MkdirAll(shortcutDir, 0755)
+	shortcutPath := filepath.Join(shortcutDir, "OpenUEM Self-Service.lnk")
+
+	psCmd := fmt.Sprintf(`$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%s'); $s.TargetPath = '%s'; $s.IconLocation = '%s,0'; $s.Description = 'OpenUEM Self-Service Portal'; $s.Save()`, shortcutPath, targetExe, targetExe)
+	if out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).CombinedOutput(); err != nil {
+		log.Printf("[WARN]: could not create start menu shortcut: %v, output: %s", err, string(out))
+	} else {
+		log.Printf("[INFO]: created start menu shortcut at %s", shortcutPath)
+	}
+}
+
+func copyTrayBinary(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
