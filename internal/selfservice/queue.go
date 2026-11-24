@@ -261,9 +261,6 @@ func (q *InstallationQueue) processTask(task *InstallationTask) {
 	output, err := q.executor.Execute(task.Package, localFilePath, task.UserToken)
 	if err != nil {
 		log.Printf("[ERROR]: installation failed for package %s: %v", task.Package.Name, err)
-		if localFilePath != "" {
-			_ = RemoveCachedFile(localFilePath)
-		}
 		q.finishTask(task, StatusFailed, output, err.Error())
 		return
 	}

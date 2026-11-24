@@ -153,8 +153,7 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens 
 	}
 
 	if execErr != nil {
-		log.Printf("[WARN]: package %s execution failed: %v. Removing cached file %s", pkg.Name, execErr, localPath)
-		_ = RemoveCachedFile(localPath)
+		log.Printf("[WARN]: package %s execution failed: %v", pkg.Name, execErr)
 		return output, execErr
 	}
 
