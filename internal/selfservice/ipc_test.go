@@ -75,6 +75,18 @@ func TestIPCDispatcher_SecurityValidation(t *testing.T) {
 	}, uintptr(33333))
 	assert.True(t, resp.Success)
 	assert.NotEmpty(t, resp.Status)
+
+	// 6. Test sync action
+	syncCalled := false
+	dispatcher.SetSyncFunc(func() error {
+		syncCalled = true
+		return nil
+	})
+	resp = dispatcher.Dispatch(IPCRequest{Action: "sync"})
+	assert.True(t, resp.Success)
+	assert.True(t, syncCalled)
+	require.NotNil(t, resp.Catalog)
+	assert.Len(t, resp.Catalog.Packages, 2)
 }
 
 func TestIPCServer_EndToEnd(t *testing.T) {
@@ -120,4 +132,8 @@ func TestIPCServer_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, resp.Success)
 	assert.Equal(t, "pkg-e2e", resp.Task.PackageID)
+}
+func TestNamedPipeConstants(t *testing.T) {
+	assert.Equal(t, `\\.\pipe\OpenUEM_SelfService_IPC`, DefaultNamedPipeName)
+	assert.Equal(t, `\\.\pipe\openuem-selfservice`, LegacyNamedPipeName)
 }

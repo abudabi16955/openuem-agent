@@ -1,35 +1,44 @@
 <!DOCTYPE html>
-<html lang="pl">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="openuem-token" content="{{TRAY_AUTH_TOKEN}}">
-  <title>OpenUEM - Portal Self-Service</title>
+  <title>OpenUEM Self-Service Portal</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header class="header">
     <div class="brand">
-      <h1>OpenUEM Self-Service Portal</h1>
-      <span>Katalog Oprogramowania</span>
+      <h1 id="appTitle">OpenUEM Self-Service Portal</h1>
+      <span id="catalogSubtitle">Software Catalog</span>
+    </div>
+    <div class="header-actions">
+      <button id="syncBtn" class="sync-btn" title="Synchronize catalog with server" onclick="syncCatalog()">
+        <svg class="sync-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+        </svg>
+        <span id="syncBtnText">Sync</span>
+      </button>
     </div>
   </header>
 
   <section class="filters-bar">
     <div class="search-box">
-      <input type="text" id="searchInput" placeholder="Szukaj aplikacji (nazwa, wydawca, opis)...">
+      <input type="text" id="searchInput" placeholder="Search applications (name, category, description)...">
     </div>
     <select id="categorySelect" class="category-select">
-      <option value="all">Wszystkie kategorie</option>
+      <option value="all">All Categories</option>
     </select>
   </section>
 
   <main id="packageGrid" class="grid">
-    <div class="empty-state">Ładowanie katalogu aplikacji...</div>
+    <div class="empty-state" id="loadingState">Loading software catalog...</div>
   </main>
 
   <div id="toast" class="toast"></div>
 
+  <script src="/locales.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
