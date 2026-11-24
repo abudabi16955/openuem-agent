@@ -144,7 +144,8 @@ var (
 func cbtHookProc(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode == HCBT_CREATEWND {
 		hwnd := wParam
-		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, WS_EX_LAYERED)
+		curStyle, _, _ := procGetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE)
+		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, curStyle|WS_EX_LAYERED)
 		procSetLayeredWindowAttributes.Call(hwnd, 0, 0, LWA_ALPHA)
 	}
 	ret, _, _ := procCallNextHookEx.Call(cbtHookHandle, uintptr(nCode), wParam, lParam)
@@ -377,7 +378,8 @@ func main() {
 	if !*openBrowser {
 		procShowWindow.Call(hwnd, SW_HIDE)
 		procSetLayeredWindowAttributes.Call(hwnd, 0, 255, LWA_ALPHA)
-		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, 0)
+		curStyle, _, _ := procGetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE)
+		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, curStyle&^WS_EX_LAYERED)
 	}
 
 	// 4. Set window and tray icon

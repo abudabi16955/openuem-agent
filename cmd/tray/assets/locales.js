@@ -1,5 +1,5 @@
 // OpenUEM Self-Service Portal Internationalization (i18n)
-// Provides complete English (EN) dictionary as standard, with locale detection.
+// Standard: 100% English (EN) across all UI elements.
 
 const locales = {
   en: {
@@ -30,43 +30,14 @@ const locales = {
     installFailed: "Installation failed",
     connectionError: "Connection error with local agent",
     sending: "Sending...",
-  },
-  pl: {
-    appTitle: "OpenUEM Self-Service Portal",
-    catalogSubtitle: "Katalog Oprogramowania",
-    searchPlaceholder: "Szukaj aplikacji (nazwa, kategoria, opis)...",
-    allCategories: "Wszystkie kategorie",
-    loadingCatalog: "Ładowanie katalogu aplikacji...",
-    emptyCatalog: "Brak pakietów spełniających kryteria.",
-    noDescription: "Brak opisu.",
-    syncButton: "Synchronizuj",
-    syncTitle: "Synchronizuj katalog z serwerem",
-    syncSuccess: "Katalog został pomyślnie zsynchronizowany",
-    syncFailed: "Błąd synchronizacji katalogu",
-    statusAvailable: "Dostępny",
-    statusQueued: "W kolejce",
-    statusDownloading: "Pobieranie",
-    statusInstalling: "Instalowanie",
-    statusInstalled: "Aktualna",
-    statusFailed: "Błąd",
-    statusProcessing: "Przetwarzanie",
-    btnInstall: "Zainstaluj",
-    btnRetry: "Ponów próbę",
-    btnUpgrade: "Zaktualizuj do v{version}",
-    installedMeta: "(zainst. v{version})",
-    upgradeBadge: "Aktualizacja (zainst. v{version})",
-    installStarted: "Rozpoczęto zadanie instalacji",
-    installFailed: "Błąd instalacji",
-    connectionError: "Błąd połączenia z agentem",
-    sending: "Wysyłanie...",
   }
 };
 
-const currentLang = (typeof navigator !== "undefined" && navigator.language && navigator.language.toLowerCase().startsWith("pl")) ? "pl" : "en";
+const currentLang = "en";
 
 function t(key, params = {}) {
-  const dict = locales[currentLang] || locales.en;
-  let str = dict[key] || locales.en[key] || key;
+  const dict = locales.en;
+  let str = dict[key] || key;
   for (const [k, v] of Object.entries(params)) {
     str = str.replace(`{${k}}`, v);
   }
