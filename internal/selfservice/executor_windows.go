@@ -74,20 +74,32 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens 
 		return "", fmt.Errorf("user execution context requires a valid user token")
 	}
 
+	// Sanity check before execution for local files (size > 0, PE signature MZ for .exe)
+	if localPath != "" && pkgType != "winget" {
+		if err := ValidateInstaller(localPath); err != nil {
+			log.Printf("[ERROR]: package %s failed installer sanity check: %v. Removing from cache.", pkg.Name, err)
+			_ = RemoveCachedFile(localPath)
+			return "", fmt.Errorf("installer sanity check failed: %w", err)
+		}
+	}
+
+	var output string
+	var execErr error
+
 	switch pkgType {
 	case "msi":
 		if execContext == "user" && localPath != "" {
 			e.prepareUserPermissions(localPath, userToken)
 		}
 		args := BuildMSIArgs(localPath, pkg.SilentArgs)
-		return e.runCommand("msiexec.exe", args, execContext, userToken)
+		output, execErr = e.runCommand("msiexec.exe", args, execContext, userToken)
 
 	case "exe":
 		if execContext == "user" && localPath != "" {
 			e.prepareUserPermissions(localPath, userToken)
 		}
 		args := BuildCustomArgs(pkg.SilentArgs)
-		return e.runCommand(localPath, args, execContext, userToken)
+		output, execErr = e.runCommand(localPath, args, execContext, userToken)
 
 	case "zip":
 		scratchDir := filepath.Join(GetSelfServiceDir(), "scratch", pkg.ID)
@@ -99,12 +111,19 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens 
 		}()
 
 		if err := ExtractZip(localPath, scratchDir); err != nil {
+			_ = RemoveCachedFile(localPath)
 			return "", fmt.Errorf("failed to extract zip package: %w", err)
 		}
 
 		exePath, err := LocateExecutableInDir(scratchDir)
 		if err != nil {
+			_ = RemoveCachedFile(localPath)
 			return "", err
+		}
+
+		if err := ValidateInstaller(exePath); err != nil {
+			_ = RemoveCachedFile(localPath)
+			return "", fmt.Errorf("extracted installer sanity check failed: %w", err)
 		}
 
 		if execContext == "user" {
@@ -114,11 +133,11 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens 
 
 		if strings.EqualFold(filepath.Ext(exePath), ".msi") {
 			args := BuildMSIArgs(exePath, pkg.SilentArgs)
-			return e.runCommand("msiexec.exe", args, execContext, userToken)
+			output, execErr = e.runCommand("msiexec.exe", args, execContext, userToken)
+		} else {
+			args := BuildCustomArgs(pkg.SilentArgs)
+			output, execErr = e.runCommand(exePath, args, execContext, userToken)
 		}
-
-		args := BuildCustomArgs(pkg.SilentArgs)
-		return e.runCommand(exePath, args, execContext, userToken)
 
 	case "winget":
 		targetID := pkg.ID
@@ -132,6 +151,14 @@ func (e *WindowsExecutor) Execute(pkg PackageItem, localPath string, userTokens 
 	default:
 		return "", fmt.Errorf("unsupported package type: %s", pkg.PackageType)
 	}
+
+	if execErr != nil {
+		log.Printf("[WARN]: package %s execution failed: %v. Removing cached file %s", pkg.Name, execErr, localPath)
+		_ = RemoveCachedFile(localPath)
+		return output, execErr
+	}
+
+	return output, nil
 }
 
 func (e *WindowsExecutor) runCommand(cmdPath string, args []string, execContext string, userToken windows.Token) (string, error) {

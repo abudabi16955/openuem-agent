@@ -104,16 +104,18 @@ func (d *Downloader) Download(pkg PackageItem, consoleBaseURL string) (string, e
 	}
 	defaultFilename := fmt.Sprintf("%s%s", pkg.ID, ext)
 
-	// Check if already cached and valid
+	// Check if already cached, valid checksum and passes sanity check
 	expectedChecksum := strings.ToLower(strings.TrimSpace(pkg.GetChecksum()))
 	cachedPath := filepath.Join(pkgCacheDir, defaultFilename)
 	if fi, err := os.Stat(cachedPath); err == nil && fi.Size() > 0 && expectedChecksum != "" {
 		if verifyChecksum(cachedPath, expectedChecksum) {
-			log.Printf("[INFO]: package %s found in cache with valid checksum", pkg.Name)
-			return cachedPath, nil
+			if err := ValidateInstaller(cachedPath); err == nil {
+				log.Printf("[INFO]: package %s found in cache with valid checksum and sanity check", pkg.Name)
+				return cachedPath, nil
+			}
 		}
 		// Stale or corrupted, remove
-		_ = os.Remove(cachedPath)
+		_ = RemoveCachedFile(cachedPath)
 	}
 
 	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
@@ -169,8 +171,16 @@ func (d *Downloader) Download(pkg PackageItem, consoleBaseURL string) (string, e
 		return "", fmt.Errorf("checksum mismatch for package %s: expected %s, got %s", pkg.Name, expectedChecksum, actualChecksum)
 	}
 
+	// Sanity check before finalizing cache file
+	if err := ValidateInstaller(tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		_ = RemoveCachedFile(destPath)
+		return "", fmt.Errorf("package sanity check failed for %s: %w", pkg.Name, err)
+	}
+
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		_ = os.Remove(tmpPath)
+		_ = RemoveCachedFile(destPath)
 		return "", fmt.Errorf("failed to finalize cache file: %w", err)
 	}
 
@@ -213,6 +223,53 @@ func (d *Downloader) PruneCache(maxAge time.Duration) error {
 			_ = os.RemoveAll(targetPath)
 			log.Printf("[INFO]: pruned old package cache: %s", targetPath)
 		}
+	}
+	return nil
+}
+
+// ValidateInstaller checks if an installer file is valid:
+// - Verifies that the file exists and has size > 0.
+// - For .exe files, verifies that the PE header begins with MZ (0x4D, 0x5A).
+func ValidateInstaller(filePath string) error {
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("installer file not found: %w", err)
+	}
+	if fi.Size() == 0 {
+		return fmt.Errorf("installer file is empty (0 bytes)")
+	}
+
+	cleanPath := strings.TrimSuffix(filePath, ".tmp")
+	ext := strings.ToLower(filepath.Ext(cleanPath))
+	if ext == ".exe" {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open installer file: %w", err)
+		}
+		defer f.Close()
+
+		var magic [2]byte
+		if _, err := io.ReadFull(f, magic[:]); err != nil {
+			return fmt.Errorf("failed to read PE signature: %w", err)
+		}
+		if magic[0] != 0x4D || magic[1] != 0x5A { // M, Z
+			return fmt.Errorf("corrupt executable: missing MZ PE header signature (got 0x%02X, 0x%02X)", magic[0], magic[1])
+		}
+	}
+
+	return nil
+}
+
+// RemoveCachedFile removes a faulty or failed installer file and its package cache directory.
+func RemoveCachedFile(filePath string) error {
+	if filePath == "" {
+		return nil
+	}
+	_ = os.Remove(filePath)
+	dir := filepath.Dir(filePath)
+	cleanDir := filepath.Clean(dir)
+	if cleanDir != "" && cleanDir != "." && cleanDir != "/" && cleanDir != filepath.VolumeName(cleanDir)+"\\" && cleanDir != filepath.VolumeName(cleanDir) {
+		return os.RemoveAll(cleanDir)
 	}
 	return nil
 }
