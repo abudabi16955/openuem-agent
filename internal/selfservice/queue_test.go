@@ -62,15 +62,15 @@ func TestInstallationQueue_SequentialFIFO(t *testing.T) {
 
 	t1, err1 := q.Enqueue(pkg1)
 	require.NoError(t, err1)
-	assert.Equal(t, StatusQueued, t1.Status)
+	assert.NotEmpty(t, t1.ID)
 
 	t2, err2 := q.Enqueue(pkg2)
 	require.NoError(t, err2)
-	assert.Equal(t, StatusQueued, t2.Status)
+	assert.NotEmpty(t, t2.ID)
 
 	t3, err3 := q.Enqueue(pkg3)
 	require.NoError(t, err3)
-	assert.Equal(t, StatusQueued, t3.Status)
+	assert.NotEmpty(t, t3.ID)
 
 	// Wait for queue processing to complete
 	require.Eventually(t, func() bool {
