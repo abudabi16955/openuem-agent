@@ -35,6 +35,7 @@ type Config struct {
 	TenantID                 string
 	ScriptsRun               string
 	WebSocketPort            string
+	ConsoleURL               string
 }
 
 func (a *Agent) ReadConfig() error {
@@ -264,6 +265,17 @@ func (a *Agent) ReadConfig() error {
 		a.Config.ScriptsRun = key.String()
 	}
 
+	// Console URL
+	if key, err := cfg.Section("Agent").GetKey("ConsoleURL"); err == nil && key.String() != "" {
+		a.Config.ConsoleURL = key.String()
+	} else if key, err := cfg.Section("Agent").GetKey("ConsoleBaseURL"); err == nil && key.String() != "" {
+		a.Config.ConsoleURL = key.String()
+	} else if key, err := cfg.Section("Console").GetKey("ConsoleURL"); err == nil && key.String() != "" {
+		a.Config.ConsoleURL = key.String()
+	} else if key, err := cfg.Section("Console").GetKey("ConsoleBaseURL"); err == nil && key.String() != "" {
+		a.Config.ConsoleURL = key.String()
+	}
+
 	log.Println("[INFO]: agent has read its settings from the INI file")
 	return nil
 }
@@ -289,6 +301,9 @@ func (c *Config) WriteConfig() error {
 	cfg.Section("Agent").Key("SFTPDisabled").SetValue(strconv.FormatBool(c.SFTPDisabled))
 	cfg.Section("Agent").Key("RemoteAssistanceDisabled").SetValue(strconv.FormatBool(c.RemoteAssistanceDisabled))
 	cfg.Section("Agent").Key("ScriptsRun").SetValue(c.ScriptsRun)
+	if c.ConsoleURL != "" {
+		cfg.Section("Agent").Key("ConsoleURL").SetValue(c.ConsoleURL)
+	}
 
 	if err := cfg.SaveTo(configFile); err != nil {
 		log.Fatalf("[FATAL]: could not save config file, reason: %v", err)

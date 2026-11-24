@@ -92,6 +92,13 @@ func NewInstallationQueue(
 	return q
 }
 
+// SetConsoleBaseURL dynamically updates the console base URL for package downloads.
+func (q *InstallationQueue) SetConsoleBaseURL(url string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.consoleBaseURL = url
+}
+
 // Enqueue adds a package installation request to the FIFO queue.
 func (q *InstallationQueue) Enqueue(pkg PackageItem, userTokens ...uintptr) (*InstallationTask, error) {
 	var userToken uintptr

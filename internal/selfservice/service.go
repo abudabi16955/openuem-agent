@@ -2,6 +2,7 @@ package selfservice
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -87,7 +88,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	ipcServer := NewIPCServer(DefaultNamedPipeName, dispatcher)
 	legacyIPCServer := NewIPCServer(LegacyNamedPipeName, dispatcher)
 
-	return &Service{
+	svc := &Service{
 		config:          cfg,
 		catalogMgr:      catalogMgr,
 		downloader:      downloader,
@@ -99,7 +100,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		legacyIPCServer: legacyIPCServer,
 		quitChan:        make(chan struct{}),
 		pruneTicker:     time.NewTicker(24 * time.Hour),
-	}, nil
+	}
+	dispatcher.SetSyncFunc(func() error {
+		return svc.SyncCatalog()
+	})
+	return svc, nil
 }
 
 // Start activates the named pipe server, NATS subscriptions, and background tasks.
@@ -117,7 +122,7 @@ func (s *Service) Start() error {
 	if s.config.NATSConn != nil && s.config.NATSConn.IsConnected() {
 		sub, err := s.config.NATSConn.Subscribe("agent.selfservice.update", func(msg *nats.Msg) {
 			log.Println("[INFO]: received agent.selfservice.update notification via NATS")
-			go s.SyncCatalog()
+			s.handleUpdateMessage(msg)
 		})
 		if err != nil {
 			log.Printf("[ERROR]: failed to subscribe to agent.selfservice.update: %v", err)
@@ -171,18 +176,44 @@ func (s *Service) Stop() {
 	log.Println("[INFO]: Self-service service stopped")
 }
 
+// SetConsoleBaseURL dynamically updates the console base URL for catalog sync and downloads.
+func (s *Service) SetConsoleBaseURL(url string) {
+	s.config.ConsoleBaseURL = url
+	if s.queue != nil {
+		s.queue.SetConsoleBaseURL(url)
+	}
+}
+
+func (s *Service) handleUpdateMessage(msg *nats.Msg) {
+	if msg != nil && len(msg.Data) > 0 {
+		var notif struct {
+			Action     string `json:"action"`
+			PackageID  string `json:"package_id,omitempty"`
+			ConsoleURL string `json:"console_url,omitempty"`
+		}
+		if err := json.Unmarshal(msg.Data, &notif); err == nil {
+			if notif.ConsoleURL != "" && notif.ConsoleURL != s.config.ConsoleBaseURL {
+				log.Printf("[INFO]: dynamically updated console URL to %s from NATS update notification", notif.ConsoleURL)
+				s.SetConsoleBaseURL(notif.ConsoleURL)
+			}
+		}
+	}
+	go func() { _ = s.SyncCatalog() }()
+}
+
 // SyncCatalog refreshes the local package catalog from console.
-func (s *Service) SyncCatalog() {
+func (s *Service) SyncCatalog() error {
 	if s.config.ConsoleBaseURL == "" {
-		return
+		return nil
 	}
 
 	log.Printf("[INFO]: syncing self-service catalog from %s", s.config.ConsoleBaseURL)
 	if err := s.catalogMgr.SyncFromConsole(s.config.ConsoleBaseURL, s.downloader.httpClient); err != nil {
 		log.Printf("[WARN]: failed to sync catalog from console: %v", err)
-	} else {
-		log.Println("[INFO]: self-service catalog synced successfully")
+		return err
 	}
+	log.Println("[INFO]: self-service catalog synced successfully")
+	return nil
 }
 
 // UpdateNATSConnection updates the active NATS connection and re-subscribes.
@@ -199,7 +230,7 @@ func (s *Service) UpdateNATSConnection(conn *nats.Conn) {
 		}
 		sub, err := conn.Subscribe("agent.selfservice.update", func(msg *nats.Msg) {
 			log.Println("[INFO]: received agent.selfservice.update notification via NATS")
-			go s.SyncCatalog()
+			s.handleUpdateMessage(msg)
 		})
 		if err == nil {
 			s.natsSub = sub

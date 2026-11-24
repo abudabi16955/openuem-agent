@@ -2295,11 +2295,12 @@ func (a *Agent) StartSelfService() {
 	a.setupTrayAutostart()
 
 	selfServiceCfg := selfservice.ServiceConfig{
-		AgentCert:     a.Config.AgentCert,
-		AgentKey:      a.Config.AgentKey,
-		CACert:        a.Config.CACert,
-		NATSConn:      a.NATSConnection,
-		AgentUUID:     a.Config.UUID,
+		AgentCert:      a.Config.AgentCert,
+		AgentKey:       a.Config.AgentKey,
+		CACert:         a.Config.CACert,
+		NATSConn:       a.NATSConnection,
+		AgentUUID:      a.Config.UUID,
+		ConsoleBaseURL: a.Config.ConsoleURL,
 		RefreshReport: func() {
 			if a.Config.Enabled {
 				if r := a.RunReport(); r != nil {

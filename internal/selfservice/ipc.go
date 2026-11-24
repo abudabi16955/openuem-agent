@@ -34,6 +34,12 @@ type IPCDispatcher struct {
 	catalogMgr     *CatalogManager
 	queue          *InstallationQueue
 	installedStore *InstalledStore
+	syncFunc       func() error
+}
+
+// SetSyncFunc sets a callback to execute when a sync action is requested via IPC.
+func (d *IPCDispatcher) SetSyncFunc(fn func() error) {
+	d.syncFunc = fn
 }
 
 // NewIPCDispatcher creates a new IPC dispatcher.
@@ -81,6 +87,22 @@ func (d *IPCDispatcher) Dispatch(req IPCRequest, userTokens ...uintptr) IPCRespo
 	switch req.Action {
 	case "get_catalog":
 		closeToken(userToken)
+		cat := d.catalogMgr.GetCatalog()
+		for i := range cat.Packages {
+			cat.Packages[i].InstalledVersion = DetectInstalledVersion(cat.Packages[i], d.installedStore)
+		}
+		return IPCResponse{
+			Success: true,
+			Catalog: &cat,
+		}
+
+	case "sync":
+		closeToken(userToken)
+		if d.syncFunc != nil {
+			if err := d.syncFunc(); err != nil {
+				log.Printf("[WARN]: IPC catalog sync failed: %v", err)
+			}
+		}
 		cat := d.catalogMgr.GetCatalog()
 		for i := range cat.Packages {
 			cat.Packages[i].InstalledVersion = DetectInstalledVersion(cat.Packages[i], d.installedStore)

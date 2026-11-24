@@ -37,9 +37,15 @@ var (
 	procDestroyMenu         = user32.NewProc("DestroyMenu")
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procLoadImageW          = user32.NewProc("LoadImageW")
-	procLoadIconW           = user32.NewProc("LoadIconW")
-	procMessageBoxW         = user32.NewProc("MessageBoxW")
-	procShellNotifyIconW    = shell32.NewProc("Shell_NotifyIconW")
+	procLoadIconW                  = user32.NewProc("LoadIconW")
+	procMessageBoxW                = user32.NewProc("MessageBoxW")
+	procShellNotifyIconW           = shell32.NewProc("Shell_NotifyIconW")
+	procSetWindowsHookExW          = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx        = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx             = user32.NewProc("CallNextHookEx")
+	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
+	procGetWindowLongPtrW          = user32.NewProc("GetWindowLongPtrW")
+	procGetCurrentThreadId         = kernel32.NewProc("GetCurrentThreadId")
 )
 
 const (
@@ -81,6 +87,12 @@ const (
 	TPM_RETURNCMD   = 0x0100
 
 	GWLP_WNDPROC = -4
+	GWL_EXSTYLE = ^uintptr(19)
+
+	WH_CBT         = 5
+	HCBT_CREATEWND = 3
+	WS_EX_LAYERED  = 0x00080000
+	LWA_ALPHA      = 0x00000002
 
 	ID_OPEN = 1001
 	ID_EXIT = 1002
@@ -126,7 +138,18 @@ var (
 	globalWV        webview2.WebView
 	globalHWnd      uintptr
 	origWndProc     uintptr
+	cbtHookHandle   uintptr
 )
+
+func cbtHookProc(nCode int32, wParam uintptr, lParam uintptr) uintptr {
+	if nCode == HCBT_CREATEWND {
+		hwnd := wParam
+		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, WS_EX_LAYERED)
+		procSetLayeredWindowAttributes.Call(hwnd, 0, 0, LWA_ALPHA)
+	}
+	ret, _, _ := procCallNextHookEx.Call(cbtHookHandle, uintptr(nCode), wParam, lParam)
+	return ret
+}
 
 func setWindowLongPtr(hwnd uintptr, nIndex int, newProc uintptr) uintptr {
 	if procSetWindowLongPtrW.Find() == nil {
@@ -310,6 +333,16 @@ func main() {
 	log.Printf("[INFO]: OpenUEM Self-Service Portal started at %s", portalURL)
 
 	// 3. Initialize WebView2 window
+	// If starting hidden (-open=false), hook window creation to set 0% opacity immediately,
+	// eliminating any white window flash on autostart before SW_HIDE takes effect.
+	var hHook uintptr
+	if !*openBrowser {
+		threadID, _, _ := procGetCurrentThreadId.Call()
+		hookCb := windows.NewCallback(cbtHookProc)
+		hHook, _, _ = procSetWindowsHookExW.Call(WH_CBT, hookCb, 0, threadID)
+		cbtHookHandle = hHook
+	}
+
 	wv := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug: false,
 		WindowOptions: webview2.WindowOptions{
@@ -319,6 +352,12 @@ func main() {
 			Center: true,
 		},
 	})
+
+	if hHook != 0 {
+		procUnhookWindowsHookEx.Call(hHook)
+		cbtHookHandle = 0
+	}
+
 	if wv == nil {
 		msgPtr, _ := windows.UTF16PtrFromString("Microsoft Edge WebView2 Runtime is required to run the OpenUEM Self-Service Portal. Please install WebView2 Runtime and try again.")
 		titlePtr, _ := windows.UTF16PtrFromString(windowTitle)
@@ -337,6 +376,8 @@ func main() {
 
 	if !*openBrowser {
 		procShowWindow.Call(hwnd, SW_HIDE)
+		procSetLayeredWindowAttributes.Call(hwnd, 0, 255, LWA_ALPHA)
+		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, 0)
 	}
 
 	// 4. Set window and tray icon

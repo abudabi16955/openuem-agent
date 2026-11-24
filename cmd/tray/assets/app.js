@@ -15,14 +15,24 @@ function authHeaders(extraHeaders = {}) {
   return headers;
 }
 
-const statusLabels = {
-  available: "Dostępny",
-  queued: "W kolejce",
-  downloading: "Pobieranie",
-  installing: "Instalowanie",
-  installed: "Aktualna",
-  failed: "Błąd"
-};
+function getStatusLabel(status) {
+  switch (status) {
+    case "available":
+      return t("statusAvailable");
+    case "queued":
+      return t("statusQueued");
+    case "downloading":
+      return t("statusDownloading");
+    case "installing":
+      return t("statusInstalling");
+    case "installed":
+      return t("statusInstalled");
+    case "failed":
+      return t("statusFailed");
+    default:
+      return t("statusProcessing");
+  }
+}
 
 // Compare two version strings (semver / numeric / alphanumeric)
 function compareVersions(v1, v2) {
@@ -60,12 +70,28 @@ function compareVersions(v1, v2) {
 
 function showToast(message, isError = false) {
   const toast = document.getElementById("toast");
+  if (!toast) return;
   toast.textContent = message;
   toast.style.background = isError ? "#dc2626" : "#1e293b";
   toast.style.display = "block";
   setTimeout(() => {
     toast.style.display = "none";
   }, 3500);
+}
+
+function applyLocales() {
+  const appTitle = document.getElementById("appTitle");
+  if (appTitle) appTitle.textContent = t("appTitle");
+  const catalogSubtitle = document.getElementById("catalogSubtitle");
+  if (catalogSubtitle) catalogSubtitle.textContent = t("catalogSubtitle");
+  const searchInput = document.getElementById("searchInput");
+  if (searchInput) searchInput.placeholder = t("searchPlaceholder");
+  const syncBtn = document.getElementById("syncBtn");
+  if (syncBtn) syncBtn.title = t("syncTitle");
+  const syncBtnText = document.getElementById("syncBtnText");
+  if (syncBtnText) syncBtnText.textContent = t("syncButton");
+  const loadingState = document.getElementById("loadingState");
+  if (loadingState) loadingState.textContent = t("loadingCatalog");
 }
 
 async function fetchCatalog() {
@@ -104,15 +130,52 @@ async function fetchStatuses() {
   }
 }
 
+async function syncCatalog() {
+  const syncBtn = document.getElementById("syncBtn");
+  if (syncBtn) {
+    syncBtn.classList.add("spinning");
+    syncBtn.disabled = true;
+  }
+  try {
+    const res = await fetch("/api/sync", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(t("syncSuccess"));
+      if (data.catalog && data.catalog.packages) {
+        packages = data.catalog.packages;
+        populateCategories();
+        renderPackages();
+      } else {
+        await fetchCatalog();
+      }
+      await fetchStatuses();
+    } else {
+      showToast(data.error || t("syncFailed"), true);
+    }
+  } catch (err) {
+    console.error("Sync error:", err);
+    showToast(t("syncFailed"), true);
+  } finally {
+    if (syncBtn) {
+      syncBtn.classList.remove("spinning");
+      syncBtn.disabled = false;
+    }
+  }
+}
+
 function populateCategories() {
   const select = document.getElementById("categorySelect");
+  if (!select) return;
   const categories = new Set();
   packages.forEach(p => {
     if (p.category) categories.add(p.category);
   });
 
   const current = select.value;
-  select.innerHTML = '<option value="all">Wszystkie kategorie</option>';
+  select.innerHTML = `<option value="all">${t("allCategories")}</option>`;
   categories.forEach(cat => {
     const opt = document.createElement("option");
     opt.value = cat;
@@ -124,6 +187,8 @@ function populateCategories() {
 
 function renderPackages() {
   const grid = document.getElementById("packageGrid");
+  if (!grid) return;
+
   const filtered = packages.filter(pkg => {
     const matchesCategory = selectedCategory === "all" || pkg.category === selectedCategory;
     const query = searchQuery.toLowerCase();
@@ -135,7 +200,7 @@ function renderPackages() {
   });
 
   if (filtered.length === 0) {
-    grid.innerHTML = '<div class="empty-state">Brak dostępnych pakietów spełniających kryteria.</div>';
+    grid.innerHTML = `<div class="empty-state">${t("emptyCatalog")}</div>`;
     return;
   }
 
@@ -153,45 +218,47 @@ function renderPackages() {
 
     if (isPending || taskStatus === "queued" || taskStatus === "downloading" || taskStatus === "installing") {
       badgeClass = taskStatus === "queued" ? "queued" : (taskStatus === "downloading" ? "downloading" : "installing");
-      badgeText = statusLabels[taskStatus] || "Przetwarzanie";
+      badgeText = getStatusLabel(taskStatus);
       buttonHtml = `<button class="btn" disabled>${badgeText}...</button>`;
     } else if (taskStatus === "failed") {
       badgeClass = "failed";
-      badgeText = "Błąd";
-      buttonHtml = `<button class="btn" onclick="installPackage('${pkgId}', this)">Ponów próbę</button>`;
+      badgeText = t("statusFailed");
+      buttonHtml = `<button class="btn" onclick="installPackage('${pkgId}', this)">${t("btnRetry")}</button>`;
     } else if (!installedVer && taskStatus !== "installed") {
-      // 1. Brak zainstalowanej wersji: przycisk „Zainstaluj”
       badgeClass = "available";
-      badgeText = "Dostępny";
-      buttonHtml = `<button class="btn" onclick="installPackage('${pkgId}', this)">Zainstaluj</button>`;
+      badgeText = t("statusAvailable");
+      buttonHtml = `<button class="btn" onclick="installPackage('${pkgId}', this)">${t("btnInstall")}</button>`;
     } else {
       const activeInstalledVer = installedVer || pkgVer;
       const cmp = compareVersions(activeInstalledVer, pkgVer);
 
       if (cmp < 0) {
-        // 2. Zainstalowana wersja jest starsza niż w katalogu: przycisk „Zaktualizuj do vX.Y.Z”
         badgeClass = "upgrade";
-        badgeText = `Aktualizacja (zainst. v${activeInstalledVer})`;
-        buttonHtml = `<button class="btn btn-upgrade" onclick="installPackage('${pkgId}', this)">Zaktualizuj do v${pkgVer}</button>`;
+        badgeText = t("upgradeBadge", { version: activeInstalledVer });
+        buttonHtml = `<button class="btn btn-upgrade" onclick="installPackage('${pkgId}', this)">${t("btnUpgrade", { version: pkgVer })}</button>`;
       } else {
-        // 3. Zainstalowana wersja jest równa lub wyższa: status/badge „Aktualna” i zablokowany przycisk
         badgeClass = "installed";
-        badgeText = "Aktualna";
-        buttonHtml = `<button class="btn" disabled>Aktualna</button>`;
+        badgeText = t("statusInstalled");
+        buttonHtml = `<button class="btn" disabled>${t("statusInstalled")}</button>`;
       }
     }
 
     const card = document.createElement("div");
     card.className = "card";
 
-    const iconHtml = pkg.icon_url
-      ? `<img src="${pkg.icon_url}" alt="${pkg.name}" onerror="this.parentElement.textContent='${(pkg.name || '?')[0]}'"/>`
-      : (pkg.name ? pkg.name[0].toUpperCase() : "P");
+    // Support dynamic icons: data URI, HTTP(S) URL, or letter fallback
+    const iconSrc = pkg.icon_url || pkg.icon || "";
+    let iconHtml = "";
+    if (iconSrc && (iconSrc.startsWith("data:image/") || iconSrc.startsWith("http://") || iconSrc.startsWith("https://"))) {
+      iconHtml = `<img src="${iconSrc}" alt="${pkg.name || ''}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" /><div style="display:none; width:100%; height:100%; align-items:center; justify-content:center; font-weight:700;">${(pkg.name || '?')[0].toUpperCase()}</div>`;
+    } else {
+      iconHtml = `<div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; font-weight:700;">${(pkg.name || '?')[0].toUpperCase()}</div>`;
+    }
 
     let metaText = pkg.publisher ? `${pkg.publisher} • ` : "";
     metaText += `v${pkgVer}`;
     if (installedVer) {
-      metaText += ` (zainst. v${installedVer})`;
+      metaText += ` ${t("installedMeta", { version: installedVer })}`;
     }
 
     card.innerHTML = `
@@ -202,7 +269,7 @@ function renderPackages() {
           <div class="meta">${metaText}</div>
         </div>
       </div>
-      <div class="card-desc">${pkg.description || "Brak opisu."}</div>
+      <div class="card-desc">${pkg.description || t("noDescription")}</div>
       <div class="card-footer">
         <span class="badge ${badgeClass}">${badgeText}</span>
         ${buttonHtml}
@@ -222,7 +289,7 @@ async function installPackage(packageId, btnElement) {
   pendingInstalls.add(packageId);
   if (btnElement) {
     btnElement.disabled = true;
-    btnElement.textContent = "Wysyłanie...";
+    btnElement.textContent = t("sending");
   }
 
   try {
@@ -233,35 +300,41 @@ async function installPackage(packageId, btnElement) {
     });
     const data = await res.json();
     if (data.success) {
-      showToast("Rozpoczęto zadanie instalacji");
+      showToast(t("installStarted"));
       statuses[packageId] = "queued";
       renderPackages();
       fetchStatuses();
     } else {
       pendingInstalls.delete(packageId);
-      showToast(data.error || "Błąd instalacji", true);
+      showToast(data.error || t("installFailed"), true);
       renderPackages();
     }
   } catch (err) {
     pendingInstalls.delete(packageId);
-    showToast("Błąd połączenia z agentem", true);
+    showToast(t("connectionError"), true);
     renderPackages();
   }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  applyLocales();
+
   const searchInput = document.getElementById("searchInput");
   const categorySelect = document.getElementById("categorySelect");
 
-  searchInput.addEventListener("input", e => {
-    searchQuery = e.target.value;
-    renderPackages();
-  });
+  if (searchInput) {
+    searchInput.addEventListener("input", e => {
+      searchQuery = e.target.value;
+      renderPackages();
+    });
+  }
 
-  categorySelect.addEventListener("change", e => {
-    selectedCategory = e.target.value;
-    renderPackages();
-  });
+  if (categorySelect) {
+    categorySelect.addEventListener("change", e => {
+      selectedCategory = e.target.value;
+      renderPackages();
+    });
+  }
 
   fetchCatalog();
   fetchStatuses();

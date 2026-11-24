@@ -100,6 +100,22 @@ func StartTrayServer(preferredPort int) (*TrayServer, error) {
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 
+	// API: Sync Catalog
+	mux.HandleFunc("/api/sync", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		resp, err := selfservice.CallIPC("", selfservice.IPCRequest{Action: "sync"})
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+
 	// API: Install Package
 	mux.HandleFunc("/api/install", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
