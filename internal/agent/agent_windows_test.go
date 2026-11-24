@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"os"
 	"bytes"
 	"path/filepath"
 	"strings"
@@ -145,5 +146,29 @@ func TestFormatTrayAutostartCommand(t *testing.T) {
 	}
 	if !strings.Contains(got, `" -open=false`) {
 		t.Errorf("expected command to contain closing quote before -open=false, got %q", got)
+	}
+}
+
+func TestVerifyTrayBinary_MissingBinaryReturnsFalse(t *testing.T) {
+	nonExistent := filepath.Join(t.TempDir(), "nonexistent-openuem-tray.exe")
+	if verifyTrayBinary(nonExistent) {
+		t.Fatalf("expected verifyTrayBinary to return false for nonexistent file %s", nonExistent)
+	}
+}
+
+func TestVerifyTrayBinary_DirectoryReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	if verifyTrayBinary(dir) {
+		t.Fatalf("expected verifyTrayBinary to return false for directory %s", dir)
+	}
+}
+
+func TestVerifyTrayBinary_ExistingExecutableReturnsTrue(t *testing.T) {
+	realExe, err := os.Executable()
+	if err != nil {
+		t.Skip("could not determine test executable path")
+	}
+	if !verifyTrayBinary(realExe) {
+		t.Fatalf("expected verifyTrayBinary to return true for real running binary %s", realExe)
 	}
 }

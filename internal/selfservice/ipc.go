@@ -6,8 +6,11 @@ import (
 	"log"
 )
 
-// DefaultNamedPipeName is the well-known Windows Named Pipe for OpenUEM Self-Service Portal.
-const DefaultNamedPipeName = `\\.\pipe\openuem-selfservice`
+// DefaultNamedPipeName is the primary Windows Named Pipe for OpenUEM Self-Service Portal IPC.
+const DefaultNamedPipeName = `\\.\pipe\OpenUEM_SelfService_IPC`
+
+// LegacyNamedPipeName is the legacy Windows Named Pipe kept for backwards compatibility.
+const LegacyNamedPipeName = `\\.\pipe\openuem-selfservice`
 
 // IPCRequest represents a request sent across the named pipe.
 type IPCRequest struct {

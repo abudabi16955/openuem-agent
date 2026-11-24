@@ -10,11 +10,23 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
 var defaultUnixSocketPath = filepath.Join(os.TempDir(), "openuem-selfservice.sock")
+
+func normalizeSocketPath(path string) string {
+	if path == "" {
+		return defaultUnixSocketPath
+	}
+	if strings.HasPrefix(path, `\\.\pipe\`) {
+		base := strings.TrimPrefix(path, `\\.\pipe\`)
+		return filepath.Join(os.TempDir(), base+".sock")
+	}
+	return path
+}
 
 // IPCServer provides socket-based IPC for non-Windows platforms.
 type IPCServer struct {
@@ -29,9 +41,7 @@ type IPCServer struct {
 
 // NewIPCServer initializes the IPC server for non-Windows platforms.
 func NewIPCServer(socketPath string, dispatcher *IPCDispatcher) *IPCServer {
-	if socketPath == "" {
-		socketPath = defaultUnixSocketPath
-	}
+	socketPath = normalizeSocketPath(socketPath)
 	return &IPCServer{
 		socketPath: socketPath,
 		dispatcher: dispatcher,
@@ -120,9 +130,7 @@ func (s *IPCServer) handleConnection(conn net.Conn) {
 
 // CallIPC connects to the mock IPC server, sends IPCRequest, and decodes IPCResponse.
 func CallIPC(socketPath string, req IPCRequest) (*IPCResponse, error) {
-	if socketPath == "" {
-		socketPath = defaultUnixSocketPath
-	}
+	socketPath = normalizeSocketPath(socketPath)
 
 	conn, err := net.DialTimeout("unix", socketPath, 3*time.Second)
 	if err != nil {

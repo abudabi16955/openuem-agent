@@ -28,6 +28,7 @@ import (
 	"github.com/open-uem/openuem-agent/internal/bitlocker"
 	"github.com/open-uem/openuem-agent/internal/selfservice"
 	"github.com/open-uem/openuem-agent/internal/commands/deploy"
+	"github.com/open-uem/openuem-agent/internal/commands/runtime"
 	rd "github.com/open-uem/openuem-agent/internal/commands/remote-desktop"
 	"github.com/open-uem/openuem-agent/internal/commands/report"
 	"github.com/open-uem/openuem-agent/internal/commands/sftp"
@@ -2369,6 +2370,11 @@ func (a *Agent) setupTrayAutostart() {
 		}
 	}
 
+	// Hard verification: verify openuem-tray.exe physically exists on disk after copy attempt
+	if !verifyTrayBinary(targetExe) {
+		return
+	}
+
 	// Create registry entry in HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 	if err != nil {
@@ -2398,6 +2404,32 @@ func (a *Agent) setupTrayAutostart() {
 	} else {
 		log.Printf("[INFO]: created start menu shortcut at %s", shortcutPath)
 	}
+
+	// Launch openuem-tray.exe in the active desktop user session immediately without relogging
+	launchTrayInUserSession(targetExe)
+}
+
+func verifyTrayBinary(targetExe string) bool {
+	fi, err := os.Stat(targetExe)
+	if err != nil || fi.IsDir() {
+		log.Printf("[ERROR]: openuem-tray.exe was not found at %s: tray autostart and launch are aborted", targetExe)
+		return false
+	}
+	return true
+}
+
+func launchTrayInUserSession(targetExe string) {
+	if pid, err := runtime.FindProcessByName("openuem-tray.exe"); err == nil && pid > 0 {
+		log.Printf("[INFO]: openuem-tray.exe is already running (PID %d), skipping launch", pid)
+		return
+	}
+
+	log.Printf("[INFO]: launching openuem-tray.exe in active desktop user session")
+	if err := runtime.RunAsUserInBackground(targetExe, []string{"-open=false"}); err != nil {
+		log.Printf("[WARN]: could not launch tray in active user session (no active desktop session found?): %v", err)
+		return
+	}
+	log.Printf("[INFO]: openuem-tray.exe successfully launched in active user session")
 }
 
 func copyTrayBinary(src, dst string) error {

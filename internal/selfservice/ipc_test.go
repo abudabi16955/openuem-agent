@@ -121,3 +121,7 @@ func TestIPCServer_EndToEnd(t *testing.T) {
 	assert.True(t, resp.Success)
 	assert.Equal(t, "pkg-e2e", resp.Task.PackageID)
 }
+func TestNamedPipeConstants(t *testing.T) {
+	assert.Equal(t, `\\.\pipe\OpenUEM_SelfService_IPC`, DefaultNamedPipeName)
+	assert.Equal(t, `\\.\pipe\openuem-selfservice`, LegacyNamedPipeName)
+}

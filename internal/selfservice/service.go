@@ -25,17 +25,18 @@ type ServiceConfig struct {
 
 // Service manages all self-service portal functionality inside openuem-agent.
 type Service struct {
-	config         ServiceConfig
-	catalogMgr     *CatalogManager
-	downloader     *Downloader
-	executor       Executor
-	reporter       DeployReporter
-	queue          *InstallationQueue
-	installedStore *InstalledStore
-	ipcServer      *IPCServer
-	natsSub        *nats.Subscription
-	pruneTicker    *time.Ticker
-	quitChan       chan struct{}
+	config          ServiceConfig
+	catalogMgr      *CatalogManager
+	downloader      *Downloader
+	executor        Executor
+	reporter        DeployReporter
+	queue           *InstallationQueue
+	installedStore  *InstalledStore
+	ipcServer       *IPCServer
+	legacyIPCServer *IPCServer
+	natsSub         *nats.Subscription
+	pruneTicker     *time.Ticker
+	quitChan        chan struct{}
 }
 
 // NewService creates a new SelfService service instance.
@@ -83,19 +84,21 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 
 	queue := NewInstallationQueue(downloader, executor, reporter, cfg.AgentUUID, cfg.ConsoleBaseURL, installedStore)
 	dispatcher := NewIPCDispatcher(catalogMgr, queue, installedStore)
-	ipcServer := NewIPCServer("", dispatcher)
+	ipcServer := NewIPCServer(DefaultNamedPipeName, dispatcher)
+	legacyIPCServer := NewIPCServer(LegacyNamedPipeName, dispatcher)
 
 	return &Service{
-		config:         cfg,
-		catalogMgr:     catalogMgr,
-		downloader:     downloader,
-		executor:       executor,
-		reporter:       reporter,
-		queue:          queue,
-		installedStore: installedStore,
-		ipcServer:      ipcServer,
-		quitChan:       make(chan struct{}),
-		pruneTicker:    time.NewTicker(24 * time.Hour),
+		config:          cfg,
+		catalogMgr:      catalogMgr,
+		downloader:      downloader,
+		executor:        executor,
+		reporter:        reporter,
+		queue:           queue,
+		installedStore:  installedStore,
+		ipcServer:       ipcServer,
+		legacyIPCServer: legacyIPCServer,
+		quitChan:        make(chan struct{}),
+		pruneTicker:     time.NewTicker(24 * time.Hour),
 	}, nil
 }
 
@@ -103,6 +106,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 func (s *Service) Start() error {
 	if err := s.ipcServer.Start(); err != nil {
 		return fmt.Errorf("failed to start IPC server: %w", err)
+	}
+	if s.legacyIPCServer != nil {
+		if err := s.legacyIPCServer.Start(); err != nil {
+			log.Printf("[WARN]: failed to start legacy IPC server on %s: %v", LegacyNamedPipeName, err)
+		}
 	}
 
 	// Subscribe to NATS self-service update notifications
@@ -150,6 +158,10 @@ func (s *Service) Stop() {
 
 	if s.ipcServer != nil {
 		s.ipcServer.Stop()
+	}
+
+	if s.legacyIPCServer != nil {
+		s.legacyIPCServer.Stop()
 	}
 
 	if s.queue != nil {

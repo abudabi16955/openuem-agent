@@ -90,7 +90,7 @@ func (s *IPCServer) Stop() {
 	}()
 
 	s.wg.Wait()
-	log.Println("[INFO]: Self-service Named Pipe server stopped")
+	log.Printf("[INFO]: Self-service Named Pipe server on %s stopped", s.pipeName)
 }
 
 func (s *IPCServer) listenLoop() {
@@ -234,11 +234,23 @@ func extractClientToken(handle windows.Handle) (windows.Token, error) {
 }
 
 // CallIPC connects to the named pipe, sends an IPCRequest, and decodes the IPCResponse.
+// If pipeName is empty, it attempts DefaultNamedPipeName first and falls back to LegacyNamedPipeName.
 func CallIPC(pipeName string, req IPCRequest) (*IPCResponse, error) {
 	if pipeName == "" {
-		pipeName = DefaultNamedPipeName
+		resp, err := callIPCPipe(DefaultNamedPipeName, req)
+		if err == nil {
+			return resp, nil
+		}
+		// Fallback to legacy pipe if primary pipe connection fails
+		if legacyResp, legacyErr := callIPCPipe(LegacyNamedPipeName, req); legacyErr == nil {
+			return legacyResp, nil
+		}
+		return resp, err
 	}
+	return callIPCPipe(pipeName, req)
+}
 
+func callIPCPipe(pipeName string, req IPCRequest) (*IPCResponse, error) {
 	pipeW, err := windows.UTF16PtrFromString(pipeName)
 	if err != nil {
 		return nil, fmt.Errorf("invalid pipe name: %w", err)
