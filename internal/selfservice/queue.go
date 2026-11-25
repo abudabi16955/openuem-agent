@@ -271,6 +271,16 @@ func (q *InstallationQueue) processTask(task *InstallationTask) {
 
 func (q *InstallationQueue) finishTask(task *InstallationTask, status JobStatus, output, errMsg string) {
 	finished := time.Now()
+
+	// Persist installed package record in installed_packages.json strictly BEFORE
+	// updating task.Status to StatusInstalled to eliminate race condition where
+	// frontend sees StatusInstalled before the package is recorded.
+	if status == StatusInstalled && q.installedStore != nil {
+		if err := q.installedStore.RecordInstalled(task.Package); err != nil {
+			log.Printf("[WARN]: failed to record installed package %s: %v", task.Package.Name, err)
+		}
+	}
+
 	q.mu.Lock()
 	task.Status = status
 	task.Output = output
@@ -278,13 +288,6 @@ func (q *InstallationQueue) finishTask(task *InstallationTask, status JobStatus,
 	task.FinishedAt = &finished
 	taskCopy := *task
 	q.mu.Unlock()
-
-	// Persist installed package record in installed_packages.json
-	if status == StatusInstalled && q.installedStore != nil {
-		if err := q.installedStore.RecordInstalled(taskCopy.Package); err != nil {
-			log.Printf("[WARN]: failed to record installed package %s: %v", taskCopy.Package.Name, err)
-		}
-	}
 
 	// Report deployment result to OpenUEM via NATS
 	if q.reporter != nil {

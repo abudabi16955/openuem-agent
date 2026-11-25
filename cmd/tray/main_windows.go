@@ -46,6 +46,8 @@ var (
 	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
 	procGetWindowLongPtrW          = user32.NewProc("GetWindowLongPtrW")
 	procGetCurrentThreadId         = kernel32.NewProc("GetCurrentThreadId")
+	procSetWindowPos               = user32.NewProc("SetWindowPos")
+	procGetSystemMetrics           = user32.NewProc("GetSystemMetrics")
 )
 
 const (
@@ -53,6 +55,14 @@ const (
 	SW_NORMAL  = 1
 	SW_SHOW    = 5
 	SW_RESTORE = 9
+
+	SWP_NOSIZE     = 0x0001
+	SWP_NOMOVE     = 0x0002
+	SWP_NOZORDER   = 0x0004
+	SWP_NOACTIVATE = 0x0010
+
+	SM_CXSCREEN = 0
+	SM_CYSCREEN = 1
 
 	MB_OK        = 0x00000000
 	MB_ICONERROR = 0x00000010
@@ -109,6 +119,26 @@ const (
 	windowTitle             = "OpenUEM Self-Service Portal"
 )
 
+type CREATESTRUCTW struct {
+	CreateParams uintptr
+	HInstance    uintptr
+	HMenu        uintptr
+	HwndParent   uintptr
+	Cy           int32
+	Cx           int32
+	Y            int32
+	X            int32
+	Style        int32
+	Name         uintptr
+	Class        uintptr
+	ExStyle      uint32
+}
+
+type CBT_CREATEWNDW struct {
+	Lpcs            *CREATESTRUCTW
+	HwndInsertAfter uintptr
+}
+
 type POINT struct {
 	X int32
 	Y int32
@@ -144,6 +174,17 @@ var (
 func cbtHookProc(nCode int32, wParam uintptr, lParam uintptr) uintptr {
 	if nCode == HCBT_CREATEWND {
 		hwnd := wParam
+		if lParam != 0 {
+			cbt := (*CBT_CREATEWNDW)(unsafe.Pointer(lParam))
+			if cbt != nil && cbt.Lpcs != nil {
+				cbt.Lpcs.X = -32000
+				cbt.Lpcs.Y = -32000
+			}
+		}
+		negCoord := int32(-32000)
+		offscreen := uintptr(uint32(negCoord))
+		procSetWindowPos.Call(hwnd, 0, offscreen, offscreen, 0, 0, SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)
+		procShowWindow.Call(hwnd, SW_HIDE)
 		curStyle, _, _ := procGetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE)
 		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, curStyle|WS_EX_LAYERED)
 		procSetLayeredWindowAttributes.Call(hwnd, 0, 0, LWA_ALPHA)
@@ -380,6 +421,19 @@ func main() {
 		procSetLayeredWindowAttributes.Call(hwnd, 0, 255, LWA_ALPHA)
 		curStyle, _, _ := procGetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE)
 		procSetWindowLongPtrW.Call(hwnd, GWL_EXSTYLE, curStyle&^WS_EX_LAYERED)
+
+		// Restore centered coordinates before user opens window
+		sWidth, _, _ := procGetSystemMetrics.Call(SM_CXSCREEN)
+		sHeight, _, _ := procGetSystemMetrics.Call(SM_CYSCREEN)
+		posX := (int32(sWidth) - 1024) / 2
+		posY := (int32(sHeight) - 720) / 2
+		if posX < 0 {
+			posX = 0
+		}
+		if posY < 0 {
+			posY = 0
+		}
+		procSetWindowPos.Call(hwnd, 0, uintptr(posX), uintptr(posY), 1024, 720, SWP_NOZORDER|SWP_NOACTIVATE)
 	}
 
 	// 4. Set window and tray icon

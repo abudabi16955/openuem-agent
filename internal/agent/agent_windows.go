@@ -2396,20 +2396,32 @@ func (a *Agent) setupTrayAutostart() {
 		}
 	}
 
-	// Create Start Menu shortcut
+	// Create Start Menu and Public Desktop shortcuts
+	targetDir = filepath.Dir(targetExe)
+
 	programData := os.Getenv("ProgramData")
 	if programData == "" {
 		programData = `C:\ProgramData`
 	}
-	shortcutDir := filepath.Join(programData, `Microsoft\Windows\Start Menu\Programs`)
-	_ = os.MkdirAll(shortcutDir, 0755)
-	shortcutPath := filepath.Join(shortcutDir, "OpenUEM Self-Service.lnk")
+	startMenuDir := filepath.Join(programData, `Microsoft\Windows\Start Menu\Programs`)
+	_ = os.MkdirAll(startMenuDir, 0755)
+	startMenuShortcut := filepath.Join(startMenuDir, "OpenUEM Self-Service.lnk")
 
-	psCmd := fmt.Sprintf(`$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%s'); $s.TargetPath = '%s'; $s.IconLocation = '%s,0'; $s.Description = 'OpenUEM Self-Service Portal'; $s.Save()`, shortcutPath, targetExe, targetExe)
+	publicDesktop := os.Getenv("PUBLIC")
+	if publicDesktop == "" {
+		publicDesktop = `C:\Users\Public`
+	}
+	desktopShortcutDir := filepath.Join(publicDesktop, "Desktop")
+	_ = os.MkdirAll(desktopShortcutDir, 0755)
+	desktopShortcut := filepath.Join(desktopShortcutDir, "OpenUEM Self-Service.lnk")
+
+	psCmd := fmt.Sprintf(`$ws = New-Object -ComObject WScript.Shell; @('%s', '%s') | ForEach-Object { $dir = Split-Path -Parent $_; if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }; $s = $ws.CreateShortcut($_); $s.TargetPath = '%s'; $s.WorkingDirectory = '%s'; $s.IconLocation = '%s,0'; $s.Description = 'OpenUEM Self-Service Portal'; $s.Save() }; try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ShellNotify { [DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2); }'; [ShellNotify]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) } catch {}`,
+		startMenuShortcut, desktopShortcut, targetExe, targetDir, targetExe)
+
 	if out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).CombinedOutput(); err != nil {
-		log.Printf("[WARN]: could not create start menu shortcut: %v, output: %s", err, string(out))
+		log.Printf("[WARN]: could not create self-service shortcuts: %v, output: %s", err, string(out))
 	} else {
-		log.Printf("[INFO]: created start menu shortcut at %s", shortcutPath)
+		log.Printf("[INFO]: created self-service shortcuts in Start Menu (%s) and Public Desktop (%s)", startMenuShortcut, desktopShortcut)
 	}
 
 	// Launch openuem-tray.exe in the active desktop user session immediately without relogging

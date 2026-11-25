@@ -161,3 +161,32 @@ func TestInstallationQueue_UserTokenPassed(t *testing.T) {
 	defer exec.mu.Unlock()
 	assert.Equal(t, dummyToken, exec.lastToken)
 }
+
+func TestInstallationQueue_RecordInstalledBeforeStatusInstalled(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := NewInstalledStore(tempDir + "/installed_packages.json")
+	require.NoError(t, err)
+	exec := &mockExecutor{}
+	rep := &mockReporter{}
+
+	q := NewInstallationQueue(nil, exec, rep, "agent-test", "", store)
+	defer q.Stop()
+
+	pkg := PackageItem{ID: "pkg-race-check", Name: "Race Check Package", Version: "1.2.3", PackageType: "winget"}
+
+	t1, err := q.Enqueue(pkg)
+	require.NoError(t, err)
+
+	var recordedBeforeStatus bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		task, found := q.GetTask(t1.ID)
+		if found && task.Status == StatusInstalled {
+			_, recordedBeforeStatus = store.GetInstalled(pkg.ID)
+			break
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+
+	assert.True(t, recordedBeforeStatus, "Package must be recorded in installedStore BEFORE status becomes StatusInstalled")
+}
