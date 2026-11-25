@@ -120,6 +120,8 @@ async function fetchCatalog() {
   }
 }
 
+const handledInstalledTasks = new Set();
+
 async function fetchStatuses() {
   try {
     const res = await fetch("/api/status", {
@@ -127,13 +129,39 @@ async function fetchStatuses() {
     });
     const data = await res.json();
     if (data.success && data.tasks) {
+      let edgeInstalledDetected = false;
+
       data.tasks.forEach(task => {
+        const prevStatus = statuses[task.package_id];
         statuses[task.package_id] = task.status;
+
         if (task.status === "installed" || task.status === "failed") {
           pendingInstalls.delete(task.package_id);
         }
+
+        // Edge detection: only trigger on transition to installed that has not been handled yet
+        const taskKey = task.id || `${task.package_id}_${task.finished_at || task.status}`;
+        if (task.status === "installed" && !handledInstalledTasks.has(taskKey)) {
+          handledInstalledTasks.add(taskKey);
+
+          // Optimistically update installed version in UI immediately
+          const pkg = packages.find(p => p.id === task.package_id);
+          if (pkg) {
+            pkg.installed_version = pkg.version;
+          }
+
+          // Trigger catalog refresh strictly on edge transition
+          if (prevStatus && prevStatus !== "installed") {
+            edgeInstalledDetected = true;
+          }
+        }
       });
-      renderPackages();
+
+      if (edgeInstalledDetected) {
+        await fetchCatalog();
+      } else {
+        renderPackages();
+      }
     }
   } catch (err) {
     console.error("Failed to fetch statuses:", err);
