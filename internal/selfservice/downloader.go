@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -120,15 +121,71 @@ func BuildMTLSClient(certPath, keyPath, caPath string) (*http.Client, error) {
 	}, nil
 }
 
+// DefaultConsolePort is the standard OpenUEM console HTTPS port.
+const DefaultConsolePort = 1323
+
+// DeriveConsoleURL derives a console HTTPS base URL from a NATS server address or host string.
+// Examples:
+//   "nats://192.168.1.140:4222" -> "https://192.168.1.140:1323"
+//   "192.168.1.140:4222"        -> "https://192.168.1.140:1323"
+//   "localhost"                 -> "https://localhost:1323"
+//   ""                          -> "https://localhost:1323"
+func DeriveConsoleURL(natsServerAddr string) string {
+	raw := strings.TrimSpace(natsServerAddr)
+	if raw == "" {
+		if env := strings.TrimSpace(os.Getenv("OPENUEM_CONSOLE_URL")); env != "" {
+			return strings.TrimRight(env, "/")
+		}
+		return fmt.Sprintf("https://localhost:%d", DefaultConsolePort)
+	}
+
+	// If multiple NATS servers are configured (comma-separated), pick the first one
+	if idx := strings.Index(raw, ","); idx != -1 {
+		raw = strings.TrimSpace(raw[:idx])
+	}
+
+	// Strip scheme if present (e.g. nats://, tls://, http://, https://)
+	if idx := strings.Index(raw, "://"); idx != -1 {
+		raw = raw[idx+3:]
+	}
+
+	// Strip userinfo if present (e.g. user:pass@host:port)
+	if idx := strings.LastIndex(raw, "@"); idx != -1 {
+		raw = raw[idx+1:]
+	}
+
+	// Strip path if present (e.g. host:port/path)
+	if idx := strings.Index(raw, "/"); idx != -1 {
+		raw = raw[:idx]
+	}
+
+	// Extract host part (removing port if present)
+	host := raw
+	if h, _, err := net.SplitHostPort(raw); err == nil && h != "" {
+		host = h
+	} else if strings.Contains(raw, ":") && !strings.Contains(raw, "]") {
+		// IPv4:port
+		parts := strings.Split(raw, ":")
+		host = parts[0]
+	}
+
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "localhost"
+	}
+
+	return fmt.Sprintf("https://%s:%d", host, DefaultConsolePort)
+}
+
 // Download downloads a package to the secure cache, verifies SHA-256, and returns the local file path.
 func (d *Downloader) Download(pkg PackageItem, consoleBaseURL string) (string, error) {
 	downloadURL := pkg.DownloadURL
 	if !strings.HasPrefix(downloadURL, "http://") && !strings.HasPrefix(downloadURL, "https://") {
-		if consoleBaseURL != "" {
-			downloadURL = strings.TrimRight(consoleBaseURL, "/") + "/" + strings.TrimLeft(downloadURL, "/")
-		} else {
-			return "", fmt.Errorf("invalid package download URL: %s", downloadURL)
+		baseURL := strings.TrimSpace(consoleBaseURL)
+		if baseURL == "" {
+			baseURL = DeriveConsoleURL("")
 		}
+		downloadURL = strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(downloadURL, "/")
 	}
 
 	pkgCacheDir := filepath.Join(d.cacheDir, pkg.ID)
