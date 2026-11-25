@@ -2294,13 +2294,19 @@ func (a *Agent) PerformBitLockerEscrow(force bool) (int, error) {
 func (a *Agent) StartSelfService() {
 	a.setupTrayAutostart()
 
+	consoleURL := a.Config.ConsoleURL
+	if consoleURL == "" {
+		consoleURL = selfservice.DeriveConsoleURL(a.Config.NATSServers)
+		log.Printf("[INFO]: ConsoleURL empty in config, derived fallback ConsoleURL %s from NATSServers", consoleURL)
+	}
+
 	selfServiceCfg := selfservice.ServiceConfig{
 		AgentCert:      a.Config.AgentCert,
 		AgentKey:       a.Config.AgentKey,
 		CACert:         a.Config.CACert,
 		NATSConn:       a.NATSConnection,
 		AgentUUID:      a.Config.UUID,
-		ConsoleBaseURL: a.Config.ConsoleURL,
+		ConsoleBaseURL: consoleURL,
 		RefreshReport: func() {
 			if a.Config.Enabled {
 				if r := a.RunReport(); r != nil {

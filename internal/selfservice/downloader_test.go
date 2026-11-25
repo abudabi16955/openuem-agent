@@ -322,3 +322,66 @@ func TestDownloader_PruneCache(t *testing.T) {
 	assert.NoDirExists(t, oldDir, "old cache entry should be pruned")
 	assert.DirExists(t, recentDir, "recent cache entry should not be pruned")
 }
+
+func TestDeriveConsoleURL(t *testing.T) {
+	tests := []struct {
+		input    string
+		env      string
+		expected string
+	}{
+		{input: "nats://192.168.1.140:4222", expected: "https://192.168.1.140:1323"},
+		{input: "tls://openuem-nats.corp:4222", expected: "https://openuem-nats.corp:1323"},
+		{input: "10.0.0.5:4222", expected: "https://10.0.0.5:1323"},
+		{input: "nats://user:pass@172.16.0.2:4222", expected: "https://172.16.0.2:1323"},
+		{input: "nats://10.0.0.1:4222,nats://10.0.0.2:4222", expected: "https://10.0.0.1:1323"},
+		{input: "", expected: "https://localhost:1323"},
+		{input: "", env: "https://custom.openuem:8443/", expected: "https://custom.openuem:8443"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input+"_env_"+tc.env, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("OPENUEM_CONSOLE_URL", tc.env)
+			} else {
+				t.Setenv("OPENUEM_CONSOLE_URL", "")
+			}
+			result := DeriveConsoleURL(tc.input)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestDownloader_FallbackConsoleURL(t *testing.T) {
+	cacheDir := t.TempDir()
+	content := append(buildRealisticPEHeader(128), []byte("fallback installer payload")...)
+	hasher := sha256.New()
+	hasher.Write(content)
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/packages/download/test-pkg", r.URL.Path)
+		w.Header().Set("Content-Disposition", "attachment; filename=\"app.exe\"")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	}))
+	defer server.Close()
+
+	t.Setenv("OPENUEM_CONSOLE_URL", server.URL)
+
+	d, err := NewDownloader(cacheDir, server.Client())
+	require.NoError(t, err)
+
+	pkg := PackageItem{
+		ID:          "test-pkg",
+		Name:        "Test App",
+		DownloadURL: "/api/v1/packages/download/test-pkg",
+		Checksum:    checksum,
+		PackageType: "exe",
+	}
+
+	// Calling Download with empty consoleBaseURL should safely fallback to env/derived URL
+	path, err := d.Download(pkg, "")
+	require.NoError(t, err)
+	assert.FileExists(t, path)
+	assert.Equal(t, "app.exe", filepath.Base(path))
+}
